@@ -37,6 +37,7 @@ def order_created():
             "event_time": int(time.time()),
             "event_id": f"purchase_{order_id}",
             "action_source": "website",
+            "event_source_url": "https://comfishop.com",
             "user_data": {
                 "em": [hashed_email],
                 "ph": [hashed_phone],
