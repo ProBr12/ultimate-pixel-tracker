@@ -48,7 +48,6 @@ def order_created():
                 "currency": "GBP"
             }
         }],
-        "test_event_code": "TEST36671",
         "access_token": ACCESS_TOKEN
     }
 
