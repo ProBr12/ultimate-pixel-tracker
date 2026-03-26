@@ -66,7 +66,6 @@ def send_capi_event(event_name, event_id, fbc=None, fbclid=None,
 
     payload = {
         "data": [event],
-        "test_event_code": "TEST36671",
         "access_token": ACCESS_TOKEN
     }
 
@@ -88,7 +87,6 @@ def order_created():
     order = request.json
     logger.info(f"Webhook received for order: {order.get('id')}")
 
-    # Extract tracking identifiers from cart attributes
     note_attributes = order.get("note_attributes", [])
     attrs = {a["name"]: a["value"] for a in note_attributes}
     fbc = attrs.get("_fbc", "")
@@ -96,13 +94,11 @@ def order_created():
 
     logger.info(f"Cookies from order: fbc={fbc} | fbclid={fbclid}")
 
-    # Customer info
     email = order.get("email", "")
     phone = order.get("phone", "")
     order_id = str(order.get("id", ""))
     total_price = order.get("total_price", "0")
 
-    # Billing address for extra signal
     billing = order.get("billing_address") or order.get(
         "shipping_address") or {}
     first_name = billing.get("first_name", "")
@@ -136,7 +132,7 @@ def order_created():
     return jsonify({'ok': True}), 200
 
 
-# Browser event relay — receives PageView, ViewContent, AddToCart etc from frontend
+# Browser event relay
 @app.route('/track', methods=['POST'])
 def track_event():
     body = request.json
