@@ -19,7 +19,7 @@ def hash_data(value):
     return hashlib.sha256(value.strip().lower().encode()).hexdigest()
 
 
-def send_capi_event(event_name, event_id, fbc=None, fbclid=None,
+def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     email=None, phone=None, first_name=None, last_name=None,
                     city=None, postcode=None, region=None, country=None,
                     value=None, currency="GBP", source_url=None):
@@ -46,8 +46,10 @@ def send_capi_event(event_name, event_id, fbc=None, fbclid=None,
         user_data["country"] = [hash_data(country.lower())]
     if fbc:
         user_data["fbc"] = fbc
-    if fbclid:
-        user_data["fbc"] = f"fb.1.{int(time.time() * 1000)}.{fbclid}" if not fbc else fbc
+    if fbp:
+        user_data["fbp"] = fbp
+    if fbclid and not fbc:
+        user_data["fbc"] = f"fb.1.{int(time.time() * 1000)}.{fbclid}"
 
     event = {
         "event_name": event_name,
@@ -70,7 +72,7 @@ def send_capi_event(event_name, event_id, fbc=None, fbclid=None,
     }
 
     logger.info(
-        f"Sending CAPI event: {event_name} | event_id: {event_id} | fbc: {fbc} | fbclid: {fbclid} | email: {email} | phone: {phone}")
+        f"Sending CAPI event: {event_name} | event_id: {event_id} | fbc: {fbc} | fbp: {fbp} | fbclid: {fbclid} | email: {email} | phone: {phone}")
 
     response = requests.post(
         f"https://graph.facebook.com/v19.0/{PIXEL_ID}/events",
@@ -90,9 +92,12 @@ def order_created():
     note_attributes = order.get("note_attributes", [])
     attrs = {a["name"]: a["value"] for a in note_attributes}
     fbc = attrs.get("_fbc", "")
+    fbp = attrs.get("_fbp", "")
     fbclid = attrs.get("_fbclid", "")
+    utm_source = attrs.get("_utm_source", "")
 
-    logger.info(f"Cookies from order: fbc={fbc} | fbclid={fbclid}")
+    logger.info(
+        f"Cookies from order: fbc={fbc} | fbp={fbp} | fbclid={fbclid} | utm_source={utm_source}")
 
     email = order.get("email", "")
     phone = order.get("phone", "")
@@ -115,6 +120,7 @@ def order_created():
         event_name="Purchase",
         event_id=f"purchase_{order_id}",
         fbc=fbc,
+        fbp=fbp,
         fbclid=fbclid,
         email=email,
         phone=phone,
@@ -137,12 +143,13 @@ def order_created():
 def track_event():
     body = request.json
     logger.info(
-        f"Browser event received: {body.get('event_name')} | fbc: {body.get('fbc')} | fbclid: {body.get('fbclid')}")
+        f"Browser event received: {body.get('event_name')} | fbc: {body.get('fbc')} | fbp: {body.get('fbp')} | fbclid: {body.get('fbclid')}")
 
     send_capi_event(
         event_name=body.get("event_name"),
         event_id=body.get("event_id", f"evt_{int(time.time())}"),
         fbc=body.get("fbc"),
+        fbp=body.get("fbp"),
         fbclid=body.get("fbclid"),
         email=body.get("email"),
         phone=body.get("phone"),
