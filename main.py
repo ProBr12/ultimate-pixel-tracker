@@ -5,6 +5,8 @@ import hashlib
 import time
 import os
 import logging
+import re
+from urllib.parse import urlparse, parse_qs
 
 # Setup logging
 logging.basicConfig(level=logging.INFO,
@@ -19,10 +21,22 @@ def hash_data(value):
     return hashlib.sha256(value.strip().lower().encode()).hexdigest()
 
 
+def normalize_phone(phone):
+    digits = re.sub(r'[^\d]', '', phone)
+    if digits.startswith('44'):
+        return digits
+    if digits.startswith('0'):
+        return '44' + digits[1:]
+    return digits
+
+
 def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     email=None, phone=None, first_name=None, last_name=None,
                     city=None, postcode=None, region=None, country=None,
-                    value=None, currency="GBP", source_url=None):
+                    value=None, currency="GBP", source_url=None,
+                    client_ip=None, user_agent=None,
+                    external_id=None, content_ids=None, content_type=None,
+                    contents=None, num_items=None, order_id=None):
 
     PIXEL_ID = os.environ.get("PIXEL_ID")
     ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
@@ -31,7 +45,7 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
     if email:
         user_data["em"] = [hash_data(email)]
     if phone:
-        user_data["ph"] = [hash_data(phone)]
+        user_data["ph"] = [hash_data(normalize_phone(phone))]
     if first_name:
         user_data["fn"] = [hash_data(first_name)]
     if last_name:
@@ -50,6 +64,12 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
         user_data["fbp"] = fbp
     if fbclid and not fbc:
         user_data["fbc"] = f"fb.1.{int(time.time() * 1000)}.{fbclid}"
+    if client_ip:
+        user_data["client_ip_address"] = client_ip
+    if user_agent:
+        user_data["client_user_agent"] = user_agent
+    if external_id:
+        user_data["external_id"] = [hash_data(str(external_id))]
 
     event = {
         "event_name": event_name,
@@ -60,11 +80,22 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
         "user_data": user_data,
     }
 
+    custom_data = {}
     if value is not None:
-        event["custom_data"] = {
-            "value": value,
-            "currency": currency
-        }
+        custom_data["value"] = value
+        custom_data["currency"] = currency
+    if content_ids:
+        custom_data["content_ids"] = content_ids
+    if content_type:
+        custom_data["content_type"] = content_type
+    if contents:
+        custom_data["contents"] = contents
+    if num_items is not None:
+        custom_data["num_items"] = num_items
+    if order_id:
+        custom_data["order_id"] = order_id
+    if custom_data:
+        event["custom_data"] = custom_data
 
     payload = {
         "data": [event],
@@ -96,6 +127,15 @@ def order_created():
     fbclid = attrs.get("_fbclid", "")
     utm_source = attrs.get("_utm_source", "")
 
+    if not fbc and not fbclid:
+        landing_site = order.get("landing_site", "") or ""
+        parsed = urlparse(landing_site)
+        qs = parse_qs(parsed.query)
+        ls_fbclid = qs.get("fbclid", [None])[0]
+        if ls_fbclid:
+            fbclid = ls_fbclid
+            logger.info(f"Recovered fbclid from landing_site: {fbclid}")
+
     logger.info(
         f"Cookies from order: fbc={fbc} | fbp={fbp} | fbclid={fbclid} | utm_source={utm_source}")
 
@@ -103,6 +143,16 @@ def order_created():
     phone = order.get("phone", "")
     order_id = str(order.get("id", ""))
     total_price = order.get("total_price", "0")
+
+    customer = order.get("customer") or {}
+    customer_id = customer.get("id")
+
+    line_items = order.get("line_items", [])
+    content_ids = [str(item.get("product_id", ""))
+                   for item in line_items if item.get("product_id")]
+    contents = [{"id": str(item.get("product_id", "")), "quantity": item.get("quantity", 1), "item_price": float(
+        item.get("price", 0))} for item in line_items if item.get("product_id")]
+    num_items = sum(item.get("quantity", 1) for item in line_items)
 
     billing = order.get("billing_address") or order.get(
         "shipping_address") or {}
@@ -113,8 +163,14 @@ def order_created():
     region = billing.get("province", "")
     country = billing.get("country_code", "")
 
+    # Extract IP and User Agent from Shopify's client_details
+    client_details = order.get("client_details") or {}
+    browser_ip = order.get(
+        "browser_ip") or client_details.get("browser_ip", "")
+    browser_ua = client_details.get("user_agent", "")
+
     logger.info(
-        f"Customer: {email} | {phone} | {city} | {postcode} | {country}")
+        f"Customer: {email} | {phone} | {city} | {postcode} | {country} | IP: {browser_ip} | UA: {browser_ua[:80]}")
 
     send_capi_event(
         event_name="Purchase",
@@ -132,7 +188,15 @@ def order_created():
         country=country,
         value=float(total_price),
         currency="GBP",
-        source_url="https://comfishop.com"
+        source_url="https://comfishop.com",
+        client_ip=browser_ip,
+        user_agent=browser_ua,
+        external_id=customer_id,
+        content_ids=content_ids,
+        content_type="product",
+        contents=contents,
+        num_items=num_items,
+        order_id=order_id
     )
 
     return jsonify({'ok': True}), 200
@@ -142,6 +206,12 @@ def order_created():
 @app.route('/track', methods=['POST'])
 def track_event():
     body = request.json
+
+    # Get IP from request (Railway uses X-Forwarded-For behind proxy)
+    client_ip = request.headers.get(
+        "X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
+    user_agent = request.headers.get("User-Agent", "")
+
     logger.info(
         f"Browser event received: {body.get('event_name')} | fbc: {body.get('fbc')} | fbp: {body.get('fbp')} | fbclid: {body.get('fbclid')}")
 
@@ -155,7 +225,9 @@ def track_event():
         phone=body.get("phone"),
         value=body.get("value"),
         currency=body.get("currency", "GBP"),
-        source_url=body.get("source_url")
+        source_url=body.get("source_url"),
+        client_ip=client_ip,
+        user_agent=user_agent
     )
 
     return jsonify({'ok': True}), 200
