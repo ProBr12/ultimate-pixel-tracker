@@ -6,7 +6,6 @@ import time
 import os
 import logging
 import re
-from urllib.parse import urlparse, parse_qs
 
 # Setup logging
 logging.basicConfig(level=logging.INFO,
@@ -19,6 +18,18 @@ CORS(app)
 
 def hash_data(value):
     return hashlib.sha256(value.strip().lower().encode()).hexdigest()
+
+
+def valid_fbc(value):
+    if not value:
+        return False
+    return value.startswith("fb.1.") and value.count(".") >= 3
+
+
+def valid_fbp(value):
+    if not value:
+        return False
+    return value.startswith("fb.1.") and value.count(".") >= 3
 
 
 def normalize_phone(phone):
@@ -58,9 +69,9 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
         user_data["st"] = [hash_data(region.lower())]
     if country:
         user_data["country"] = [hash_data(country.lower())]
-    if fbc:
+    if valid_fbc(fbc):
         user_data["fbc"] = fbc
-    if fbp:
+    if valid_fbp(fbp):
         user_data["fbp"] = fbp
     if fbclid and not fbc:
         user_data["fbc"] = f"fb.1.{int(time.time() * 1000)}.{fbclid}"
@@ -129,9 +140,13 @@ def order_created():
 
     if not fbc and not fbclid:
         landing_site = order.get("landing_site", "") or ""
-        parsed = urlparse(landing_site)
-        qs = parse_qs(parsed.query)
-        ls_fbclid = qs.get("fbclid", [None])[0]
+        raw_query = landing_site.split("?", 1)[1] if "?" in landing_site else ""
+        ls_fbclid = None
+        for part in raw_query.split("&"):
+            eq = part.find("=")
+            if eq != -1 and part[:eq] == "fbclid":
+                ls_fbclid = part[eq + 1:]
+                break
         if ls_fbclid:
             fbclid = ls_fbclid
             logger.info(f"Recovered fbclid from landing_site: {fbclid}")
