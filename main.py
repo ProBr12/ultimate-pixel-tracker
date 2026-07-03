@@ -114,11 +114,12 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
     }
 
     logger.info(
-        f"Sending CAPI event: {event_name} | event_id: {event_id} | fbc: {fbc} | fbp: {fbp} | fbclid: {fbclid} | email: {email} | phone: {phone}")
+        f"Sending CAPI event: {event_name} | event_id: {event_id} | url: {source_url} | vid: {external_id} | fbc: {fbc} | fbp: {fbp} | fbclid: {fbclid} | email: {email} | phone: {phone}")
 
     response = requests.post(
         f"https://graph.facebook.com/v19.0/{PIXEL_ID}/events",
-        json=payload
+        json=payload,
+        timeout=10
     )
 
     logger.info(f"Meta CAPI response: {response.status_code} {response.text}")
@@ -137,6 +138,7 @@ def order_created():
     fbp = attrs.get("_fbp", "")
     fbclid = attrs.get("_fbclid", "")
     utm_source = attrs.get("_utm_source", "")
+    vid = attrs.get("_comfi_vid", "")
 
     if not fbc and not fbclid:
         landing_site = order.get("landing_site", "") or ""
@@ -152,7 +154,7 @@ def order_created():
             logger.info(f"Recovered fbclid from landing_site: {fbclid}")
 
     logger.info(
-        f"Cookies from order: fbc={fbc} | fbp={fbp} | fbclid={fbclid} | utm_source={utm_source}")
+        f"Cookies from order: vid={vid} | fbc={fbc} | fbp={fbp} | fbclid={fbclid} | utm_source={utm_source}")
 
     email = order.get("email", "")
     phone = order.get("phone", "")
@@ -206,7 +208,7 @@ def order_created():
         source_url="https://comfishop.com",
         client_ip=browser_ip,
         user_agent=browser_ua,
-        external_id=customer_id,
+        external_id=vid or customer_id,
         content_ids=content_ids,
         content_type="product",
         contents=contents,
@@ -227,8 +229,10 @@ def track_event():
         "X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
     user_agent = request.headers.get("User-Agent", "")
 
+    vid = body.get("vid")
+
     logger.info(
-        f"Browser event received: {body.get('event_name')} | fbc: {body.get('fbc')} | fbp: {body.get('fbp')} | fbclid: {body.get('fbclid')}")
+        f"Browser event received: {body.get('event_name')} | url: {body.get('source_url')} | ref: {body.get('referrer')} | vid: {vid} | fbc: {body.get('fbc')} | fbp: {body.get('fbp')} | fbclid: {body.get('fbclid')}")
 
     send_capi_event(
         event_name=body.get("event_name"),
@@ -242,7 +246,8 @@ def track_event():
         currency=body.get("currency", "GBP"),
         source_url=body.get("source_url"),
         client_ip=client_ip,
-        user_agent=user_agent
+        user_agent=user_agent,
+        external_id=vid
     )
 
     return jsonify({'ok': True}), 200
