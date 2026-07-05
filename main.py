@@ -2,6 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import hashlib
+import hmac
+import base64
 import time
 import os
 import logging
@@ -14,6 +16,77 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
+
+
+# ============ DATABASE LAYER ============
+import psycopg2
+from urllib.parse import urlparse, parse_qs
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+def init_db():
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL not set - events will NOT be saved to the database.")
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id SERIAL PRIMARY KEY,
+                ts TIMESTAMPTZ DEFAULT now(),
+                event_name TEXT,
+                vid TEXT,
+                url TEXT,
+                path TEXT,
+                referrer TEXT,
+                ad_id TEXT,
+                adset_id TEXT,
+                campaign_id TEXT,
+                utm_source TEXT,
+                value NUMERIC,
+                order_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
+            CREATE INDEX IF NOT EXISTS idx_events_vid ON events (vid);
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Database ready.")
+    except Exception as e:
+        logger.error(f"DB init failed: {e}")
+
+
+def save_event_db(event_name, vid=None, url=None, referrer=None, value=None, order_id=None):
+    """Save every event to our own database. Never allowed to break tracking:
+    if the DB is down, we log the error and Meta still gets the event."""
+    if not DATABASE_URL:
+        return
+    try:
+        parsed = urlparse(url or "")
+        q = parse_qs(parsed.query)
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO events (event_name, vid, url, path, referrer, ad_id, adset_id, campaign_id, utm_source, value, order_id)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (event_name, vid, url, parsed.path or None, referrer,
+             q.get("ad_id", [None])[0],
+             q.get("utm_term", [None])[0],
+             q.get("campaign_id", [None])[0],
+             q.get("utm_source", [None])[0],
+             value, order_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"DB write failed: {e}")
+
+
+init_db()
+
 
 
 def hash_data(value):
@@ -126,9 +199,33 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
     return response
 
 
+def verify_shopify_webhook(raw_body, hmac_header):
+    """Check that this webhook genuinely came from Shopify.
+    Shopify signs every webhook with a secret only you and Shopify know.
+    If SHOPIFY_WEBHOOK_SECRET is not set yet, we allow the request through
+    (so nothing breaks before you configure it) but log a loud warning."""
+    secret = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
+    if not secret:
+        logger.warning(
+            "SHOPIFY_WEBHOOK_SECRET not set - webhook accepted WITHOUT verification. Set it in Railway ASAP.")
+        return True
+    if not hmac_header:
+        return False
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    computed = base64.b64encode(digest).decode()
+    return hmac.compare_digest(computed, hmac_header)
+
+
 # Shopify order webhook — fires Purchase event
 @app.route('/webhook/order-created', methods=['POST'])
 def order_created():
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+    if not verify_shopify_webhook(raw_body, hmac_header):
+        logger.warning(
+            f"Webhook REJECTED - invalid signature. Source IP: {request.headers.get('X-Forwarded-For', request.remote_addr)}")
+        return jsonify({'error': 'unauthorized'}), 401
+
     order = request.json
     logger.info(f"Webhook received for order: {order.get('id')}")
 
@@ -189,6 +286,13 @@ def order_created():
     logger.info(
         f"Customer: {email} | {phone} | {city} | {postcode} | {country} | IP: {browser_ip} | UA: {browser_ua[:80]}")
 
+    save_event_db(
+        event_name="Purchase",
+        vid=vid,
+        url=order.get("landing_site"),
+        value=float(total_price),
+        order_id=order_id)
+
     send_capi_event(
         event_name="Purchase",
         event_id=f"purchase_{order_id}",
@@ -234,6 +338,13 @@ def track_event():
     logger.info(
         f"Browser event received: {body.get('event_name')} | url: {body.get('source_url')} | ref: {body.get('referrer')} | vid: {vid} | fbc: {body.get('fbc')} | fbp: {body.get('fbp')} | fbclid: {body.get('fbclid')}")
 
+    save_event_db(
+        event_name=body.get("event_name"),
+        vid=vid,
+        url=body.get("source_url"),
+        referrer=body.get("referrer"),
+        value=body.get("value"))
+
     send_capi_event(
         event_name=body.get("event_name"),
         event_id=body.get("event_id", f"evt_{int(time.time())}"),
@@ -251,6 +362,144 @@ def track_event():
     )
 
     return jsonify({'ok': True}), 200
+
+
+
+
+# ============ DASHBOARD ============
+
+SESSION_SQL = """
+WITH ordered AS (
+    SELECT vid, ts, event_name, path, ad_id, value,
+           CASE WHEN lag(ts) OVER (PARTITION BY vid ORDER BY ts) IS NULL
+                  OR ts - lag(ts) OVER (PARTITION BY vid ORDER BY ts) > interval '30 minutes'
+                THEN 1 ELSE 0 END AS is_new
+    FROM events
+    WHERE ts >= now() - (%s || ' days')::interval
+      AND vid IS NOT NULL
+),
+numbered AS (
+    SELECT *, sum(is_new) OVER (PARTITION BY vid ORDER BY ts) AS sess_no
+    FROM ordered
+),
+sessions AS (
+    SELECT vid, sess_no,
+           min(ts) AS started,
+           (array_agg(ad_id ORDER BY ts) FILTER (WHERE ad_id IS NOT NULL))[1] AS ad_id,
+           (array_agg(path ORDER BY ts))[1] AS landing,
+           bool_or(event_name = 'ViewContent' OR path LIKE '/products/%%') AS pdp,
+           bool_or(event_name = 'AddToCart') AS atc,
+           bool_or(event_name = 'InitiateCheckout') AS ic,
+           bool_or(event_name = 'Purchase') AS purchase,
+           coalesce(max(value) FILTER (WHERE event_name = 'Purchase'), 0) AS revenue
+    FROM numbered
+    GROUP BY vid, sess_no
+)
+"""
+
+
+def q(cur, sql, params):
+    cur.execute(SESSION_SQL + sql, params)
+    return cur.fetchall()
+
+
+def pct(a, b):
+    return f"{a / b * 100:.0f}%" if b else "-"
+
+
+def render_rows(rows, headers):
+    th = "".join(f"<th>{h}</th>" for h in headers)
+    trs = ""
+    for r in rows:
+        tds = "".join(f"<td>{c}</td>" for c in r)
+        trs += f"<tr>{tds}</tr>"
+    return f"<table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>"
+
+
+@app.route('/dashboard')
+def dashboard():
+    if request.args.get("key") != os.environ.get("DASH_PASSWORD"):
+        return "Unauthorized", 401
+    if not DATABASE_URL:
+        return "DATABASE_URL not configured", 500
+
+    days = max(1, min(int(request.args.get("days", 7)), 90))
+    conn = psycopg2.connect(DATABASE_URL)
+    cur = conn.cursor()
+
+    total = q(cur, """
+        SELECT count(*),
+               count(*) FILTER (WHERE pdp),
+               count(*) FILTER (WHERE atc),
+               count(*) FILTER (WHERE ic),
+               count(*) FILTER (WHERE purchase),
+               coalesce(sum(revenue), 0)
+        FROM sessions""", (str(days),))[0]
+    ses, pdp, atc, ic, pur, rev = total
+
+    per_ad = q(cur, """
+        SELECT coalesce(ad_id, '(no ad id)'),
+               count(*),
+               count(*) FILTER (WHERE pdp),
+               count(*) FILTER (WHERE atc),
+               count(*) FILTER (WHERE ic),
+               count(*) FILTER (WHERE purchase),
+               coalesce(sum(revenue), 0)
+        FROM sessions GROUP BY 1 ORDER BY 2 DESC LIMIT 25""", (str(days),))
+
+    per_landing = q(cur, """
+        SELECT coalesce(landing, '?'),
+               count(*),
+               count(*) FILTER (WHERE pdp),
+               count(*) FILTER (WHERE purchase)
+        FROM sessions GROUP BY 1 ORDER BY 2 DESC LIMIT 15""", (str(days),))
+
+    daily = q(cur, """
+        SELECT to_char(date_trunc('day', started), 'DD Mon'),
+               count(*),
+               count(*) FILTER (WHERE pdp),
+               count(*) FILTER (WHERE atc),
+               count(*) FILTER (WHERE purchase),
+               coalesce(sum(revenue), 0)
+        FROM sessions GROUP BY date_trunc('day', started)
+        ORDER BY date_trunc('day', started) DESC""", (str(days),))
+
+    cur.close()
+    conn.close()
+
+    funnel_html = render_rows([[
+        ses, f"{pdp} ({pct(pdp, ses)})", f"{atc} ({pct(atc, pdp)} of PDP)",
+        f"{ic} ({pct(ic, atc)} of ATC)", pur, f"&pound;{rev:.0f}",
+        pct(pur, ses)
+    ]], ["Sessions", "Product page", "Add to cart", "Checkout", "Purchases", "Revenue", "CVR"])
+
+    ad_rows = [[a, s, f"{p} ({pct(p, s)})", c, i, pu, f"&pound;{r:.0f}"]
+               for a, s, p, c, i, pu, r in per_ad]
+    landing_rows = [[l, s, f"{p} ({pct(p, s)})", pu] for l, s, p, pu in per_landing]
+    daily_rows = [[d, s, p, c, pu, f"&pound;{r:.0f}"] for d, s, p, c, pu, r in daily]
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comfi Dashboard</title>
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; margin: 2rem auto; max-width: 960px; padding: 0 1rem; color: #1a1a1a; }}
+h1 {{ font-size: 22px; }} h2 {{ font-size: 16px; margin-top: 2.2rem; color: #444; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
+th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #e5e5e5; }}
+th {{ color: #777; font-weight: 500; font-size: 12px; text-transform: uppercase; }}
+.range a {{ margin-right: 10px; color: #2a78d6; text-decoration: none; }}
+</style></head><body>
+<h1>Comfi - true funnel (last {days} days)</h1>
+<p class="range">Range:
+<a href="?key={request.args.get('key')}&days=1">today</a>
+<a href="?key={request.args.get('key')}&days=7">7d</a>
+<a href="?key={request.args.get('key')}&days=30">30d</a>
+<a href="?key={request.args.get('key')}&days=90">90d</a></p>
+<h2>Funnel</h2>{funnel_html}
+<h2>Per ad</h2>{render_rows(ad_rows, ["Ad ID", "Sessions", "Product page", "ATC", "Checkout", "Purchases", "Revenue"])}
+<h2>Per landing page</h2>{render_rows(landing_rows, ["Landing", "Sessions", "Product page", "Purchases"])}
+<h2>Daily</h2>{render_rows(daily_rows, ["Day", "Sessions", "PDP", "ATC", "Purchases", "Revenue"])}
+</body></html>"""
 
 
 if __name__ == "__main__":
