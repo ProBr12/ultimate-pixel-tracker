@@ -105,8 +105,19 @@ def valid_fbp(value):
     return value.startswith("fb.1.") and value.count(".") >= 3
 
 
-def normalize_phone(phone):
-    digits = re.sub(r'[^\d]', '', phone)
+def normalize_phone(phone, country="GB"):
+    """US FIX: country-aware phone normalization.
+    Meta hashes phones WITH country code. US/CA 10-digit numbers get a leading 1.
+    UK behaviour unchanged."""
+    digits = re.sub(r'[^\d]', '', phone or "")
+    if not digits:
+        return digits
+    country = (country or "GB").upper()
+    if country in ("US", "CA"):
+        if len(digits) == 10:
+            return "1" + digits
+        return digits
+    # UK default
     if digits.startswith('44'):
         return digits
     if digits.startswith('0'):
@@ -125,19 +136,27 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
     PIXEL_ID = os.environ.get("PIXEL_ID")
     ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 
+    country_code = (country or "").upper()
+
     user_data = {}
     if email:
         user_data["em"] = [hash_data(email)]
     if phone:
-        user_data["ph"] = [hash_data(normalize_phone(phone))]
+        # US FIX: pass country so normalization matches Meta's expected format
+        user_data["ph"] = [hash_data(normalize_phone(phone, country_code or "GB"))]
     if first_name:
         user_data["fn"] = [hash_data(first_name)]
     if last_name:
         user_data["ln"] = [hash_data(last_name)]
     if city:
-        user_data["ct"] = [hash_data(city.lower())]
+        # US FIX (helps UK too): Meta's ct format is lowercase letters only, no spaces
+        user_data["ct"] = [hash_data(re.sub(r'[^a-z]', '', city.lower()))]
     if postcode:
-        user_data["zp"] = [hash_data(postcode.lower().replace(" ", ""))]
+        # US FIX: strip spaces/dashes; US ZIPs hashed as first 5 digits only
+        zp = postcode.lower().replace(" ", "").replace("-", "")
+        if country_code == "US":
+            zp = zp[:5]
+        user_data["zp"] = [hash_data(zp)]
     if region:
         user_data["st"] = [hash_data(region.lower())]
     if country:
@@ -274,7 +293,8 @@ def order_created():
     last_name = billing.get("last_name", "")
     city = billing.get("city", "")
     postcode = billing.get("zip", "")
-    region = billing.get("province", "")
+    # US FIX: province_code gives "CA" not "California" — the format Meta actually matches on
+    region = billing.get("province_code") or billing.get("province", "")
     country = billing.get("country_code", "")
 
     # Extract IP and User Agent from Shopify's client_details
@@ -308,7 +328,8 @@ def order_created():
         region=region,
         country=country,
         value=float(total_price),
-        currency="GBP",
+        # US FIX: total_price is always shop currency — pair it with the order's own currency field
+        currency=order.get("currency", "GBP"),
         source_url="https://comfishop.com",
         client_ip=browser_ip,
         user_agent=browser_ua,
