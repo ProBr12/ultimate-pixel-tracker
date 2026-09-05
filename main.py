@@ -131,10 +131,11 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     value=None, currency="GBP", source_url=None,
                     client_ip=None, user_agent=None,
                     external_id=None, content_ids=None, content_type=None,
-                    contents=None, num_items=None, order_id=None):
+                    contents=None, num_items=None, order_id=None,
+                    pixel_id=None, access_token=None):
 
-    PIXEL_ID = os.environ.get("PIXEL_ID")
-    ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
+    PIXEL_ID = pixel_id if pixel_id is not None else os.environ.get("PIXEL_ID")
+    ACCESS_TOKEN = access_token if access_token is not None else os.environ.get("ACCESS_TOKEN")
 
     country_code = (country or "").upper()
 
@@ -344,15 +345,92 @@ def order_created():
     return jsonify({'ok': True}), 200
 
 
+# WooCommerce requests use base64-encoded HMAC-SHA256, matching the plugin.
+def verify_comfi_signature(raw_body, signature, secret):
+    if not secret or not signature:
+        return False
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    return hmac.compare_digest(base64.b64encode(digest), signature.encode("utf-8"))
+
+
+@app.route('/webhook/woo-order', methods=['POST'])
+def woo_order_created():
+    if not verify_comfi_signature(
+            request.get_data(), request.headers.get("X-Comfi-Webhook-Signature", ""),
+            os.environ.get("WOO_WEBHOOK_SECRET", "")):
+        return jsonify({'error': 'unauthorized'}), 401
+
+    pixel_id = os.environ.get("WOO_PIXEL_ID")
+    access_token = os.environ.get("WOO_ACCESS_TOKEN")
+    if not pixel_id or not access_token:
+        return jsonify({'error': 'WooCommerce credentials not configured'}), 503
+
+    order = request.get_json()
+    if not isinstance(order, dict) or not order.get("event_id"):
+        return jsonify({'error': 'event_id required'}), 400
+    billing = order.get("billing") or {}
+    attrs = order.get("attribution") or {}
+    items = order.get("line_items") or []
+    order_id = str(order.get("id", ""))
+    vid = attrs.get("vid")
+    value = float(order.get("total", 0))
+    source_url = order.get("landing_site") or "https://comfistore.com"
+
+    response = send_capi_event(
+        event_name="Purchase",
+        event_id=order["event_id"],
+        fbc=attrs.get("fbc"), fbp=attrs.get("fbp"), fbclid=attrs.get("fbclid"),
+        email=billing.get("email"), phone=billing.get("phone"),
+        first_name=billing.get("first_name"), last_name=billing.get("last_name"),
+        city=billing.get("city"), postcode=billing.get("postcode"),
+        region=billing.get("state"), country=billing.get("country"),
+        value=value, currency=order.get("currency", "GBP"),
+        source_url=source_url,
+        client_ip=order.get("customer_ip_address"),
+        user_agent=order.get("customer_user_agent"),
+        external_id=vid or order.get("customer_id"),
+        content_ids=[str(item["product_id"]) for item in items if item.get("product_id")],
+        content_type="product",
+        contents=[{"id": str(item["product_id"]), "quantity": item.get("quantity", 1),
+                   "item_price": float(item.get("price", 0))}
+                  for item in items if item.get("product_id")],
+        num_items=sum(item.get("quantity", 1) for item in items),
+        order_id=order_id, pixel_id=pixel_id, access_token=access_token)
+    if not 200 <= response.status_code < 300:
+        return jsonify({'error': 'Meta delivery failed'}), 502
+
+    save_event_db("Purchase", vid=vid, url=source_url, value=value, order_id=order_id)
+    return jsonify({'ok': True}), 200
+
+
 # Browser event relay
 @app.route('/track', methods=['POST'])
 def track_event():
+    woo_options = {}
+    if "X-Comfi-Signature" in request.headers:
+        if not verify_comfi_signature(
+                request.get_data(), request.headers.get("X-Comfi-Signature", ""),
+                os.environ.get("TRACK_SHARED_SECRET", "")):
+            return jsonify({'error': 'unauthorized'}), 401
+        pixel_id = os.environ.get("WOO_PIXEL_ID")
+        access_token = os.environ.get("WOO_ACCESS_TOKEN")
+        if not pixel_id or not access_token:
+            return jsonify({'error': 'WooCommerce credentials not configured'}), 503
+        woo_options = {"pixel_id": pixel_id, "access_token": access_token}
+
     body = request.json
 
     # Get IP from request (Railway uses X-Forwarded-For behind proxy)
     client_ip = request.headers.get(
         "X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
     user_agent = request.headers.get("User-Agent", "")
+
+    if woo_options:
+        client_ip = body.get("client_ip") or client_ip
+        user_agent = body.get("user_agent") or user_agent
+        woo_options.update({key: body.get(key) for key in (
+            "first_name", "last_name", "city", "postcode", "region", "country",
+            "content_ids", "content_type", "contents", "num_items")})
 
     vid = body.get("vid")
 
@@ -366,7 +444,7 @@ def track_event():
         referrer=body.get("referrer"),
         value=body.get("value"))
 
-    send_capi_event(
+    response = send_capi_event(
         event_name=body.get("event_name"),
         event_id=body.get("event_id", f"evt_{int(time.time())}"),
         fbc=body.get("fbc"),
@@ -379,8 +457,12 @@ def track_event():
         source_url=body.get("source_url"),
         client_ip=client_ip,
         user_agent=user_agent,
-        external_id=vid
+        external_id=vid,
+        **woo_options
     )
+
+    if woo_options and not 200 <= response.status_code < 300:
+        return jsonify({'error': 'Meta delivery failed'}), 502
 
     return jsonify({'ok': True}), 200
 
