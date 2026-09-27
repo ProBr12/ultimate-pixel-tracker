@@ -8,6 +8,11 @@ import time
 import os
 import logging
 import re
+import json
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
 
 # Setup logging
 logging.basicConfig(level=logging.INFO,
@@ -603,6 +608,404 @@ th {{ color: #777; font-weight: 500; font-size: 12px; text-transform: uppercase;
 <h2>Per landing page</h2>{render_rows(landing_rows, ["Landing", "Sessions", "Product page", "Purchases"])}
 <h2>Daily</h2>{render_rows(daily_rows, ["Day", "Sessions", "PDP", "ATC", "Purchases", "Revenue"])}
 </body></html>"""
+
+
+# ============ ISOLATED GOOGLE PURCHASE IMPORT ============
+# GOOGLE_TRACKING_ENABLED enables storage/worker; GOOGLE_UPLOADS_ENABLED permits Google requests.
+# Neither changes the Meta or WooCommerce routes above. Credentials never enter browser code.
+GOOGLE_CLICK_KEYS = ("gclid", "gbraid", "wbraid")
+GOOGLE_WINDOW_MS = 30 * 86400 * 1000
+
+
+def google_log(event, **fields):
+    logger.info(json.dumps({"channel": "google", "event": event, **fields}, default=str))
+
+
+@contextmanager
+def google_db():
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def init_google_db():
+    with google_db() as conn, conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS google_context (
+                id BIGSERIAL PRIMARY KEY, received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                vid TEXT, client_id TEXT, checkout_token TEXT, order_id TEXT,
+                context JSONB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS google_context_vid ON google_context (vid, received_at DESC);
+            CREATE INDEX IF NOT EXISTS google_context_client ON google_context (client_id, received_at DESC);
+            CREATE INDEX IF NOT EXISTS google_context_checkout ON google_context (checkout_token, received_at DESC);
+            CREATE TABLE IF NOT EXISTS google_purchase_delivery (
+                id BIGSERIAL PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                shop TEXT NOT NULL, order_id TEXT NOT NULL, action_id TEXT NOT NULL,
+                snapshot JSONB NOT NULL, payload JSONB, request_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt TIMESTAMPTZ NOT NULL DEFAULT now(), lease_until TIMESTAMPTZ,
+                diagnostics JSONB NOT NULL DEFAULT '{}',
+                UNIQUE (shop, order_id, action_id)
+            );
+        """)
+
+
+def google_order_id(value):
+    match = re.fullmatch(r"(?:gid://shopify/Order/)?([0-9]+)", str(value or ""))
+    if not match:
+        raise ValueError("invalid_order_id")
+    return match[1]
+
+
+def google_text(value, maximum=256):
+    if value is None:
+        return None
+    if not isinstance(value, str) or len(value) > maximum or any(ord(c) < 32 for c in value):
+        raise ValueError("invalid_context_field")
+    return value or None
+
+
+def google_click(state, at_ms):
+    """Return a whole eligible click record, never mix identifiers from different visits."""
+    if not isinstance(state, dict):
+        return {}
+    try:
+        ts = int(state.get("captured_at", 0))
+    except (ValueError, TypeError):
+        return {}
+    if not 0 <= at_ms - ts <= GOOGLE_WINDOW_MS:
+        return {}
+    click = {key: state.get(key) or "" for key in GOOGLE_CLICK_KEYS}
+    if not any(click.values()) or any(not isinstance(v, str) or
+            (v and not re.fullmatch(r"[A-Za-z0-9_-]{1,512}", v)) for v in click.values()):
+        return {}
+    return {**click, "captured_at": ts}
+
+
+def google_context_body(body):
+    if not isinstance(body, dict) or body.get("source") not in ("theme", "pixel"):
+        raise ValueError("invalid_context")
+    privacy = body.get("consent") or {}
+    if not isinstance(privacy, dict) or any(type(privacy.get(key)) is not bool for key in ("marketingAllowed", "saleOfDataAllowed")):
+        raise ValueError("missing_consent_state")
+    result = {key: google_text(body.get(key)) for key in ("vid", "client_id", "checkout_token")}
+    if not result["vid"] and not result["client_id"]:
+        raise ValueError("missing_visitor")
+    result["order_id"] = google_order_id(body["order_id"]) if body.get("order_id") else None
+    result["source"] = body["source"]
+    result["consent"] = {key: privacy[key] for key in ("marketingAllowed", "saleOfDataAllowed")}
+    result["consent_ts"] = int(time.time() * 1000)  # Server receipt, not a client-controlled ordering key.
+    state = body.get("attribution") or {}
+    click = google_click(state, result["consent_ts"])
+    result["attribution"] = {}
+    if all(result["consent"].values()) and click:
+        for key in ("landing_url", "referrer"):
+            url = urlparse(google_text(state.get(key), 2048) or "")
+            click[key] = f"{url.scheme}://{url.netloc}{url.path}" if url.scheme in ("http", "https") else ""
+        click["utm_source"] = google_text(state.get("utm_source"), 100) or ""
+        result["attribution"] = click
+    return result
+
+
+@app.route('/google/context', methods=['POST'])
+def google_context_received():
+    if os.environ.get("GOOGLE_TRACKING_ENABLED") != "true" or not DATABASE_URL:
+        return jsonify(error="google_tracking_disabled"), 503
+    if len(request.get_data()) > 8192:
+        return jsonify(error="context_too_large"), 413
+    try:
+        context = google_context_body(request.get_json(silent=True))
+    except (ValueError, TypeError) as exc:
+        return jsonify(error=str(exc)), 400
+    try:
+        with google_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO google_context (vid, client_id, checkout_token, order_id, context)
+                           VALUES (%s,%s,%s,%s,%s::jsonb)""",
+                        (context["vid"], context["client_id"], context["checkout_token"],
+                         context["order_id"], json.dumps(context)))
+        google_log("context_saved", source=context["source"], vid=context["vid"],
+                   order_id=context["order_id"], click_types=[k for k in GOOGLE_CLICK_KEYS
+                   if context["attribution"].get(k)], consent=context["consent"])
+        return jsonify(ok=True), 200
+    except Exception as exc:
+        google_log("context_storage_failed", error_type=type(exc).__name__)
+        return jsonify(error="storage_unavailable"), 503
+
+
+def google_user_data(order):
+    identifiers = []
+    email = re.sub(r"\s+", "", str(order.get("email") or "")).lower()
+    if re.fullmatch(r"[^@]+@[^@]+\.[^@]+", email):
+        local, domain = email.rsplit("@", 1)
+        if domain in ("gmail.com", "googlemail.com"):
+            local = local.split("+", 1)[0].replace(".", "")
+        identifiers.append({"emailAddress": hash_data(local + "@" + domain)})
+    billing = order.get("billing_address") or order.get("shipping_address") or {}
+    phone = re.sub(r"[\s().-]", "", str(order.get("phone") or billing.get("phone") or ""))
+    # Only hash an unambiguous E.164 number; do not reuse Meta's phone normalization.
+    if re.fullmatch(r"\+[1-9][0-9]{7,14}", phone):
+        identifiers.append({"phoneNumber": hash_data(phone)})
+    return {"userIdentifiers": identifiers} if identifiers else {}
+
+
+def google_paid_snapshot(order, triggered_at):
+    order_id = google_order_id(order.get("id"))
+    price_set = order.get("total_price_set") or {}
+    money = price_set.get("presentment_money") or price_set.get("shop_money") or {
+        "amount": order.get("total_price"), "currency_code": order.get("currency")}
+    try:
+        amount = Decimal(str(money["amount"]))
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError("invalid_value")
+    except (InvalidOperation, KeyError, TypeError):
+        raise ValueError("invalid_value")
+    currency = money.get("currency_code", "")
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise ValueError("invalid_currency")
+    paid_at = datetime.fromisoformat(triggered_at.replace("Z", "+00:00")) if triggered_at else datetime.now(timezone.utc)
+    if paid_at.tzinfo is None or paid_at > datetime.now(timezone.utc) + timedelta(minutes=5):
+        raise ValueError("invalid_paid_time")
+    attrs = {a["name"]: a.get("value", "") for a in order.get("note_attributes", []) if "name" in a}
+    return {"order_id": order_id, "event_time": paid_at.isoformat(), "value": str(amount), "currency": currency,
+            "vid": attrs.get("_comfi_vid") or None, "checkout_token": order.get("checkout_token"),
+            "utm_source": attrs.get("_utm_source", ""),
+            "click": {**{k: attrs.get("_" + k, "") for k in GOOGLE_CLICK_KEYS},
+                      "captured_at": attrs.get("_google_click_ts", "")},
+            "user_data": google_user_data(order)}
+
+
+@app.route('/webhook/google-order-paid', methods=['POST'])
+def google_order_paid():
+    secret = os.environ.get("SHOPIFY_WEBHOOK_SECRET")
+    shop = os.environ.get("GOOGLE_SHOP_DOMAIN", "")
+    customer = os.environ.get("GOOGLE_ADS_CUSTOMER_ID", "")
+    action = os.environ.get("GOOGLE_ADS_CONVERSION_ACTION_ID", "")
+    login = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or customer
+    if (os.environ.get("GOOGLE_TRACKING_ENABLED") != "true" or not DATABASE_URL or not secret or not shop
+            or not re.fullmatch(r"[0-9]{10}", login)
+            or not re.fullmatch(r"[0-9]{10}", customer) or not re.fullmatch(r"[0-9]+", action)):
+        return jsonify(error="google_tracking_not_configured"), 503
+    if (not verify_shopify_webhook(request.get_data(), request.headers.get("X-Shopify-Hmac-Sha256", ""))
+            or request.headers.get("X-Shopify-Shop-Domain") != shop
+            or request.headers.get("X-Shopify-Topic") != "orders/paid"):
+        return jsonify(error="unauthorized"), 401
+    order = request.get_json(silent=True)
+    if not isinstance(order, dict):
+        return jsonify(error="invalid_order"), 400
+    if order.get("test") or order.get("cancelled_at") or order.get("financial_status") != "paid":
+        google_log("order_skipped", reason="not_eligible_paid_order")
+        return jsonify(ok=True, skipped=True), 200
+    try:
+        snapshot = google_paid_snapshot(order, request.headers.get("X-Shopify-Triggered-At", ""))
+        snapshot["customer_id"] = customer
+        snapshot["login_id"] = os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID") or customer
+        with google_db() as conn, conn.cursor() as cur:
+            cur.execute("""INSERT INTO google_purchase_delivery (shop, order_id, action_id, snapshot, next_attempt)
+                           VALUES (%s,%s,%s,%s::jsonb,now() + interval '15 seconds')
+                           ON CONFLICT (shop, order_id, action_id) DO NOTHING""",
+                        (shop, snapshot["order_id"], action, json.dumps(snapshot)))
+            inserted = bool(cur.rowcount)
+        google_log("paid_order_saved", order_id=snapshot["order_id"], inserted=inserted,
+                   value=snapshot["value"], currency=snapshot["currency"])
+        return jsonify(ok=True), 200
+    except (ValueError, TypeError) as exc:
+        google_log("invalid_paid_order", error_type=type(exc).__name__)
+        return jsonify(error="invalid_order_fields"), 400
+    except Exception as exc:
+        google_log("paid_order_storage_failed", error_type=type(exc).__name__)
+        return jsonify(error="storage_unavailable"), 503
+
+
+def google_order_context(conn, snapshot):
+    """Require checkout-token agreement for browser order links; an order ID alone is not proof."""
+    with conn.cursor() as cur:
+        cur.execute("""SELECT context FROM google_context WHERE checkout_token=%s
+                       AND (order_id IS NULL OR order_id=%s) ORDER BY id DESC LIMIT 1""",
+                    (snapshot.get("checkout_token"), snapshot["order_id"]))
+        row = cur.fetchone()
+        bridge = row[0] if row else {}
+        vid = snapshot.get("vid") or bridge.get("vid")
+        client = bridge.get("client_id")
+        if snapshot.get("vid") and bridge.get("vid") and snapshot["vid"] != bridge["vid"]:
+            return None, "conflicting_visitor"
+        cur.execute("""SELECT context FROM google_context
+                       WHERE (vid=%s OR client_id=%s OR (checkout_token=%s AND (order_id IS NULL OR order_id=%s)))
+                       AND received_at > now() - interval '30 days' ORDER BY id DESC LIMIT 100""",
+                    (vid, client, snapshot.get("checkout_token"), snapshot["order_id"]))
+        contexts = [r[0] for r in cur.fetchall()]
+    if not contexts:
+        return None, "missing_context"
+    vid = vid or next((c.get("vid") for c in contexts if c.get("vid")), None)
+    if not all(contexts[0].get("consent", {}).get(k) is True for k in ("marketingAllowed", "saleOfDataAllowed")):
+        return None, "consent_not_granted"
+    at_ms = int(datetime.fromisoformat(snapshot["event_time"]).timestamp() * 1000)
+    revoked_at = max((c.get("consent_ts", 0) for c in contexts
+                      if not all(c.get("consent", {}).values())), default=0)
+    if revoked_at >= at_ms:
+        return None, "consent_revoked_after_purchase"
+    click = google_click(snapshot.get("click"), at_ms)
+    if click and click["captured_at"] <= revoked_at:
+        click = {}
+    source = "cart" if click else "none"
+    for context in contexts:
+        candidate = google_click(context.get("attribution"), at_ms)
+        if candidate and candidate["captured_at"] > revoked_at and (
+                not click or candidate["captured_at"] > click["captured_at"]):
+            click = candidate
+            source = "checkout_bridge" if bridge else "visitor"
+    return {"click": click, "consent": contexts[0]["consent"], "vid": vid, "source": source}, None
+
+
+def google_purchase_payload(row, context):
+    snapshot = row["snapshot"]
+    privacy = context["consent"]
+    if not all(privacy.get(k) is True for k in ("marketingAllowed", "saleOfDataAllowed")):
+        raise ValueError("consent_not_granted")
+    event = {"transactionId": f"{row['shop']}:{row['order_id']}", "eventTimestamp": snapshot["event_time"],
+             "eventSource": "WEB", "conversionValue": float(Decimal(snapshot["value"])),
+             "currency": snapshot["currency"],
+             "consent": {"adUserData": "CONSENT_GRANTED" if privacy["saleOfDataAllowed"] else "CONSENT_DENIED",
+                         "adPersonalization": "CONSENT_GRANTED" if privacy["marketingAllowed"] else "CONSENT_DENIED"}}
+    click = context["click"]
+    for key in ("gclid", "wbraid", "gbraid"):
+        if click.get(key):
+            event["adIdentifiers"] = {key: click[key]}
+            break
+    if snapshot["user_data"]:
+        event["userData"] = snapshot["user_data"]
+    if not event.get("adIdentifiers") and not event.get("userData"):
+        raise ValueError("missing_identifiers")
+    destination = {"operatingAccount": {"accountType": "GOOGLE_ADS", "accountId": snapshot["customer_id"]},
+                   "loginAccount": {"accountType": "GOOGLE_ADS", "accountId": snapshot["login_id"]},
+                   "productDestinationId": row["action_id"]}
+    return {"destinations": [destination], "events": [event], "encoding": "HEX"}
+
+
+def google_processing_result(body, action_id, customer_id=None):
+    results = body.get("requestStatusPerDestination", [])
+    result = next((r for r in results if r.get("destination", {}).get("productDestinationId") == action_id
+                   and (customer_id is None or r.get("destination", {}).get("operatingAccount", {}).get("accountId") == customer_id)), None)
+    if not result:
+        return "accepted", {"reason": "awaiting_destination_status"}
+    status = result.get("requestStatus")
+    diagnostics = {key: result[key] for key in ("errorInfo", "warningInfo", "eventsIngestionStatus") if key in result}
+    if status == "SUCCESS":
+        return "processed", diagnostics  # Processing success is not proof of Ads attribution/bidding.
+    if status in ("FAILED", "PARTIAL_SUCCESS"):
+        reasons = {item.get("reason") for item in result.get("errorInfo", {}).get("errorCounts", [])}
+        transient = {"PROCESSING_ERROR_REASON_INTERNAL_ERROR", "PROCESSING_ERROR_REASON_TOO_RECENT_CLICK"}
+        if status == "FAILED" and reasons and reasons <= transient:
+            return "retry", diagnostics
+        return "failed", diagnostics
+    return "accepted", diagnostics
+
+
+def google_delivery_update(row_id, status, diagnostics, delay=60, request_id=None, clear_request=False):
+    with google_db() as conn, conn.cursor() as cur:
+        cur.execute("""UPDATE google_purchase_delivery SET status=%s, diagnostics=%s::jsonb,
+                       next_attempt=now()+(%s * interval '1 second'), lease_until=NULL,
+                       request_id=CASE WHEN %s THEN NULL ELSE COALESCE(%s,request_id) END WHERE id=%s""",
+                    (status, json.dumps(diagnostics), delay, clear_request, request_id, row_id))
+    google_log("delivery_status", delivery_id=row_id, status=status, request_id=request_id, diagnostics=diagnostics)
+
+
+def google_deliver_one(session):
+    from psycopg2.extras import RealDictCursor
+    with google_db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""SELECT * FROM google_purchase_delivery
+                       WHERE status IN ('pending','waiting_context','retry','accepted') AND next_attempt<=now()
+                       AND (lease_until IS NULL OR lease_until<now())
+                       AND (%s='' OR order_id=%s) ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1""",
+                    (os.environ.get("GOOGLE_TEST_ORDER_ID", ""), os.environ.get("GOOGLE_TEST_ORDER_ID", "")))
+        row = cur.fetchone()
+        if not row:
+            return False
+        cur.execute("""UPDATE google_purchase_delivery SET lease_until=now()+interval '120 seconds',
+                       attempts=attempts+1 WHERE id=%s""", (row["id"],))
+    try:
+        if datetime.now(timezone.utc) - row["created_at"] > timedelta(days=2):
+            google_delivery_update(row["id"], "needs_review", {"reason": "delivery_deadline"})
+            return True
+        if row["request_id"]:
+            response = session.get("https://datamanager.googleapis.com/v1/requestStatus:retrieve",
+                                   params={"requestId": row["request_id"]}, timeout=20)
+        else:
+            with google_db() as conn:
+                context, reason = google_order_context(conn, row["snapshot"])
+                if not context:
+                    google_delivery_update(row["id"], "waiting_context", {"reason": reason})
+                    return True
+                if not row["payload"]:
+                    row["payload"] = google_purchase_payload(row, context)
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE google_purchase_delivery SET payload=%s::jsonb WHERE id=%s",
+                                    (json.dumps(row["payload"]), row["id"]))
+            google_log("purchase_upload", order_id=row["order_id"], vid=context["vid"],
+                       attribution_source=context["source"],
+                       click_types=list(row["payload"]["events"][0].get("adIdentifiers", {})))
+            response = session.post("https://datamanager.googleapis.com/v1/events:ingest",
+                                    json=row["payload"], timeout=20)
+        if not response.ok:
+            status = "retry" if response.status_code == 429 or response.status_code >= 500 else "failed"
+            try:
+                error = response.json().get("error", {})
+                details = {"http_status": response.status_code, "api_status": error.get("status"),
+                           "reasons": [d.get("reason") for d in error.get("details", []) if d.get("reason")]}
+            except ValueError:
+                details = {"http_status": response.status_code}
+            google_delivery_update(row["id"], status, details,
+                                   min(3600, 30 * 2 ** min(row["attempts"], 7)))
+            return True
+        body = response.json()
+        if row["request_id"]:
+            status, diagnostics = google_processing_result(body, row["action_id"], row["snapshot"]["customer_id"])
+            if row["diagnostics"].get("fieldWarnings"):
+                diagnostics["fieldWarnings"] = row["diagnostics"]["fieldWarnings"]
+            if status == "retry":
+                diagnostics["previous_request_id"] = row["request_id"]
+            google_delivery_update(row["id"], status, diagnostics, delay=300 if status == "retry" else 60,
+                                   request_id=row["request_id"], clear_request=status == "retry")
+        elif body.get("requestId"):
+            google_delivery_update(row["id"], "accepted", {"fieldWarnings": body.get("fieldWarnings", [])},
+                                   request_id=body["requestId"])
+        else:
+            google_delivery_update(row["id"], "needs_review", {"reason": "missing_request_id"})
+    except ValueError as exc:
+        google_delivery_update(row["id"], "needs_review", {"reason": str(exc)[:100]})
+    except Exception as exc:
+        google_delivery_update(row["id"], "retry", {"error_type": type(exc).__name__},
+                               min(3600, 30 * 2 ** min(row["attempts"], 7)))
+    return True
+
+
+def google_worker():
+    session = None
+    ready = False
+    while True:
+        try:
+            if not ready:
+                init_google_db()
+                ready = True
+            if os.environ.get("GOOGLE_UPLOADS_ENABLED") == "true":
+                if session is None:
+                    from google.oauth2.service_account import Credentials
+                    from google.auth.transport.requests import AuthorizedSession
+                    credentials = Credentials.from_service_account_info(
+                        json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+                        scopes=["https://www.googleapis.com/auth/datamanager"])
+                    session = AuthorizedSession(credentials)
+                google_deliver_one(session)
+        except Exception as exc:
+            google_log("worker_error", error_type=type(exc).__name__)
+        time.sleep(5)
+
+
+if os.environ.get("GOOGLE_TRACKING_ENABLED") == "true" and DATABASE_URL:
+    threading.Thread(target=google_worker, name="google-delivery", daemon=True).start()
 
 
 if __name__ == "__main__":

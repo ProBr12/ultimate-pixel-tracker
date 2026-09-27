@@ -3,4 +3,4 @@ flask-cors
 requests
 psycopg2-binary
 gunicorn
- 
+google-auth>=2.40,<3
