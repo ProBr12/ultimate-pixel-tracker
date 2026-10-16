@@ -147,9 +147,18 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
     user_data = {}
     if email:
         user_data["em"] = [hash_data(email)]
-    if phone:
+    # phone may be one number or a list (billing, shipping, customer record).
+    phones = phone if isinstance(phone, (list, tuple)) else [phone]
+    phone_hashes = []
+    for p in phones:
         # US FIX: pass country so normalization matches Meta's expected format
-        user_data["ph"] = [hash_data(normalize_phone(phone, country_code or "GB"))]
+        digits = normalize_phone(p, country_code or "GB")
+        if len(digits) >= 10:
+            h = hash_data(digits)
+            if h not in phone_hashes:
+                phone_hashes.append(h)
+    if phone_hashes:
+        user_data["ph"] = phone_hashes
     if first_name:
         user_data["fn"] = [hash_data(first_name)]
     if last_name:
@@ -177,8 +186,16 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
         user_data["client_ip_address"] = client_ip
     if user_agent:
         user_data["client_user_agent"] = user_agent
-    if external_id:
-        user_data["external_id"] = [hash_data(str(external_id))]
+    # external_id may be one ID or a list (visitor ID and Shopify customer ID).
+    ext_ids = external_id if isinstance(external_id, (list, tuple)) else [external_id]
+    ext_hashes = []
+    for e in ext_ids:
+        if e:
+            h = hash_data(str(e))
+            if h not in ext_hashes:
+                ext_hashes.append(h)
+    if ext_hashes:
+        user_data["external_id"] = ext_hashes
 
     event = {
         "event_name": event_name,
@@ -211,8 +228,10 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
         "access_token": ACCESS_TOKEN
     }
 
+    # Log which keys were matched, never the customer's actual details.
     logger.info(
-        f"Sending CAPI event: {event_name} | event_id: {event_id} | url: {source_url} | vid: {external_id} | fbc: {fbc} | fbp: {fbp} | fbclid: {fbclid} | email: {email} | phone: {phone}")
+        f"Sending CAPI event: {event_name} | event_id: {event_id} | url: {source_url} | "
+        f"keys: {','.join(sorted(user_data.keys()))}")
 
     response = requests.post(
         f"https://graph.facebook.com/v19.0/{PIXEL_ID}/events",
@@ -261,6 +280,16 @@ def order_created():
     fbclid = attrs.get("_fbclid", "")
     utm_source = attrs.get("_utm_source", "")
     vid = attrs.get("_comfi_vid", "")
+    order_id = str(order.get("id", ""))
+
+    # Express checkout / Buy it now skip the cart, so the cart attributes are
+    # missing. Fill the gaps from what the checkout pixel sent (/meta/context).
+    context = {}
+    if not (vid and fbp and fbc):
+        context = meta_context_lookup(order.get("checkout_token"))
+        vid = vid or context.get("vid") or ""
+        fbp = fbp or context.get("fbp") or ""
+        fbc = fbc or context.get("fbc") or ""
 
     if not fbc and not fbclid:
         landing_site = order.get("landing_site", "") or ""
@@ -276,15 +305,27 @@ def order_created():
             logger.info(f"Recovered fbclid from landing_site: {fbclid}")
 
     logger.info(
-        f"Cookies from order: vid={vid} | fbc={fbc} | fbp={fbp} | fbclid={fbclid} | utm_source={utm_source}")
+        f"Identifiers for order {order_id}: vid={bool(vid)} fbc={bool(fbc)} fbp={bool(fbp)} "
+        f"fbclid={bool(fbclid)} from_context={bool(context)} utm_source={utm_source}")
 
     email = order.get("email", "")
-    phone = order.get("phone", "")
-    order_id = str(order.get("id", ""))
     total_price = order.get("total_price", "0")
 
     customer = order.get("customer") or {}
     customer_id = customer.get("id")
+    shipping = order.get("shipping_address") or {}
+    billing_raw = order.get("billing_address") or {}
+
+    # Shopify almost never fills order.phone (0 of the last 50 orders); the
+    # number sits on the billing address, shipping address or customer record.
+    # Billing first: that is the buyer, the shipping phone may be a relative's.
+    phones = []
+    for p in (order.get("phone"), billing_raw.get("phone"), customer.get("phone")):
+        if p and p not in phones:
+            phones.append(p)
+    # Shipping phone only as a fallback: the recipient may not be the buyer.
+    if not phones and shipping.get("phone"):
+        phones.append(shipping.get("phone"))
 
     line_items = order.get("line_items", [])
     content_ids = [str(item.get("product_id", ""))
@@ -307,10 +348,7 @@ def order_created():
     client_details = order.get("client_details") or {}
     browser_ip = order.get(
         "browser_ip") or client_details.get("browser_ip", "")
-    browser_ua = client_details.get("user_agent", "")
-
-    logger.info(
-        f"Customer: {email} | {phone} | {city} | {postcode} | {country} | IP: {browser_ip} | UA: {browser_ua[:80]}")
+    browser_ua = client_details.get("user_agent") or context.get("user_agent", "")
 
     save_event_db(
         event_name="Purchase",
@@ -326,7 +364,7 @@ def order_created():
         fbp=fbp,
         fbclid=fbclid,
         email=email,
-        phone=phone,
+        phone=phones,
         first_name=first_name,
         last_name=last_name,
         city=city,
@@ -339,7 +377,9 @@ def order_created():
         source_url="https://comfishop.com",
         client_ip=browser_ip,
         user_agent=browser_ua,
-        external_id=vid or customer_id,
+        # Both IDs: the browser sends the visitor ID, Meta can also join on the
+        # customer ID across repeat orders.
+        external_id=[vid, customer_id],
         content_ids=content_ids,
         content_type="product",
         contents=contents,
@@ -348,6 +388,114 @@ def order_created():
     )
 
     return jsonify({'ok': True}), 200
+
+
+# ============ META CHECKOUT CONTEXT ============
+# The checkout pixel posts the shopper's real _fbp/_fbc cookies, visitor ID and
+# user agent here, keyed by checkout token. order_created uses them when the
+# order has no cart attributes (express checkout skips the cart).
+
+META_CONTEXT_PATTERNS = {
+    "checkout_token": r"[A-Za-z0-9_-]{8,128}",
+    "order_id": r"[0-9]{1,20}",
+    "vid": r"v_[a-z0-9]{6,40}",
+    "fbp": r"fb\.[0-9]\.[0-9]{10,16}\.[0-9]{1,30}",
+    "fbc": r"fb\.[0-9]\.[0-9]{10,16}\.[A-Za-z0-9_-]{10,600}",
+}
+
+
+def init_meta_context_db():
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS meta_context (
+                    id BIGSERIAL PRIMARY KEY,
+                    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    checkout_token TEXT, order_id TEXT, vid TEXT,
+                    fbp TEXT, fbc TEXT, user_agent TEXT
+                );
+                CREATE INDEX IF NOT EXISTS meta_context_checkout
+                    ON meta_context (checkout_token, received_at DESC);
+                CREATE INDEX IF NOT EXISTS meta_context_order
+                    ON meta_context (order_id, received_at DESC);
+            """)
+        conn.close()
+    except Exception as e:
+        logger.error(f"meta_context init failed: {e}")
+
+
+init_meta_context_db()
+
+
+@app.route('/meta/context', methods=['POST'])
+def meta_context_received():
+    if not DATABASE_URL:
+        return jsonify(error="storage_unavailable"), 503
+    raw = request.get_data()
+    if len(raw) > 4096:
+        return jsonify(error="too_large"), 413
+    try:
+        body = json.loads(raw)  # sent as text/plain to avoid a CORS preflight
+    except (ValueError, TypeError):
+        return jsonify(error="invalid_json"), 400
+    if not isinstance(body, dict):
+        return jsonify(error="invalid_body"), 400
+
+    clean = {}
+    for key, pattern in META_CONTEXT_PATTERNS.items():
+        value = body.get(key)
+        if isinstance(value, str) and re.fullmatch(pattern, value):
+            clean[key] = value
+    if not clean.get("checkout_token"):
+        return jsonify(error="missing_checkout_token"), 400
+    ua = body.get("user_agent")
+    clean["user_agent"] = ua[:512] if isinstance(ua, str) else None
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO meta_context (checkout_token, order_id, vid, fbp, fbc, user_agent)
+                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                (clean.get("checkout_token"), clean.get("order_id"), clean.get("vid"),
+                 clean.get("fbp"), clean.get("fbc"), clean.get("user_agent")))
+        conn.close()
+    except Exception as e:
+        logger.error(f"meta_context write failed: {type(e).__name__}")
+        return jsonify(error="storage_unavailable"), 503
+    return jsonify(ok=True), 200
+
+
+def meta_context_lookup(checkout_token):
+    """Newest non-empty value of each identifier for this checkout, from the
+    last 7 days. Matches on the checkout token only: it is long and random,
+    unlike order IDs, so nobody can attach data to someone else's order.
+    Returns {} on any problem: tracking must never fail on it."""
+    if not DATABASE_URL or not checkout_token:
+        return {}
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT vid, fbp, fbc, user_agent FROM meta_context
+                   WHERE checkout_token = %s
+                     AND received_at > now() - interval '7 days'
+                   ORDER BY received_at DESC LIMIT 50""",
+                (checkout_token,))
+            rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        logger.error(f"meta_context lookup failed: {type(e).__name__}")
+        return {}
+    result = {}
+    for row in rows:
+        for key, value in zip(("vid", "fbp", "fbc", "user_agent"), row):
+            if value and key not in result:
+                result[key] = value
+    return result
 
 
 # WooCommerce requests use base64-encoded HMAC-SHA256, matching the plugin.
