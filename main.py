@@ -556,6 +556,39 @@ def woo_order_created():
     return jsonify({'ok': True}), 200
 
 
+# ============ BOT FILTER ============
+# On hearcomfi.com 84% of relayed events were bots (mostly Facebook's link
+# preview crawler fetching /meta.json), all sent to Meta as real PageViews.
+# Purchase is never filtered: a real sale must never be dropped.
+
+BOT_UA = re.compile(
+    r"(?i)(bot[/;)\s]|bot$|crawl|spider|slurp|externalhit|facebookcatalog|"
+    r"headless|lighthouse|pagespeed|pingdom|uptime|monitor|python-|curl/|wget/|"
+    r"postman|go-http-client|okhttp|java/|axios/|node-fetch|scrapy|ahrefs|"
+    r"semrush|petalbot|bytespider|gptbot|claudebot|ccbot|perplexity|"
+    r"vaultpress|detect|scanner|preview)")
+
+NON_PAGE_PATH = re.compile(
+    r"(?i)(\.(json|txt|xml|js|css|png|jpe?g|gif|svg|ico|webp|map|php)$"
+    r"|^/(wp-json|wp-admin|wp-content|wp-includes|wp-cron|xmlrpc|api|feed|cdn-cgi)(/|$)"
+    r"|^/sitemap)")
+
+
+def bot_reason(event_name, user_agent, source_url):
+    """Why this event looks automated, or None if it looks like a person."""
+    if event_name == "Purchase":
+        return None
+    if not user_agent:
+        return "no_user_agent"
+    match = BOT_UA.search(user_agent)
+    if match:
+        return f"ua:{match.group(0).strip(' /;)').lower()}"
+    path = urlparse(source_url or "").path or "/"
+    if NON_PAGE_PATH.search(path):
+        return f"path:{path[:60]}"
+    return None
+
+
 # Browser event relay
 @app.route('/track', methods=['POST'])
 def track_event():
@@ -586,6 +619,12 @@ def track_event():
             "content_ids", "content_type", "contents", "num_items")})
 
     vid = body.get("vid")
+
+    reason = bot_reason(body.get("event_name"), user_agent, body.get("source_url"))
+    if reason:
+        # 200 so the sender (theme or WordPress relay) treats it as handled.
+        logger.info(f"Skipped bot event: {body.get('event_name')} | {reason}")
+        return jsonify({'ok': True, 'skipped': 'bot'}), 200
 
     logger.info(
         f"Browser event received: {body.get('event_name')} | url: {body.get('source_url')} | ref: {body.get('referrer')} | vid: {vid} | fbc: {body.get('fbc')} | fbp: {body.get('fbp')} | fbclid: {body.get('fbclid')}")
