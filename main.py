@@ -562,7 +562,8 @@ def woo_order_created():
 # Purchase is never filtered: a real sale must never be dropped.
 
 BOT_UA = re.compile(
-    r"(?i)(bot[/;)\s]|bot$|crawl|spider|slurp|externalhit|facebookcatalog|"
+    # "(?<!cu)" keeps real CUBOT-brand phones from matching "bot".
+    r"(?i)((?<!cu)bot(?:[/;)\-\s]|$)|crawl|spider|slurp|externalhit|facebookcatalog|"
     r"headless|lighthouse|pagespeed|pingdom|uptime|monitor|python-|curl/|wget/|"
     r"postman|go-http-client|okhttp|java/|axios/|node-fetch|scrapy|ahrefs|"
     r"semrush|petalbot|bytespider|gptbot|claudebot|ccbot|perplexity|"
