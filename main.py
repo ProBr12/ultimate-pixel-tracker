@@ -98,16 +98,34 @@ def hash_data(value):
     return hashlib.sha256(value.strip().lower().encode()).hexdigest()
 
 
+# Real Meta click IDs are long base64url strings. The old check let through
+# junk like "fb.1.1779838569048.fbclid" (found on a live cart), which Meta
+# reads as a broken click ID.
+FBC_RE = re.compile(r"fb\.[0-9]\.[0-9]{10,16}\.[A-Za-z0-9_-]{10,600}")
+FBP_RE = re.compile(r"fb\.[0-9]\.[0-9]{10,16}\.[0-9]{1,30}")
+FBCLID_RE = re.compile(r"[A-Za-z0-9_-]{10,600}")
+
+
 def valid_fbc(value):
-    if not value:
-        return False
-    return value.startswith("fb.1.") and value.count(".") >= 3
+    return isinstance(value, str) and bool(FBC_RE.fullmatch(value))
 
 
 def valid_fbp(value):
-    if not value:
+    return isinstance(value, str) and bool(FBP_RE.fullmatch(value))
+
+
+def valid_fbclid(value):
+    return isinstance(value, str) and bool(FBCLID_RE.fullmatch(value))
+
+
+def fbc_recent(value, days=90):
+    """A stored click ID is reused only within Meta's own 90-day _fbc lifetime."""
+    if not valid_fbc(value):
         return False
-    return value.startswith("fb.1.") and value.count(".") >= 3
+    created_ms = int(value.split(".")[2])
+    if created_ms < 10 ** 12:  # creation time in seconds, not milliseconds
+        created_ms *= 1000
+    return time.time() * 1000 - created_ms < days * 86400 * 1000
 
 
 def normalize_phone(phone, country="GB"):
@@ -130,6 +148,67 @@ def normalize_phone(phone, country="GB"):
     return digits
 
 
+MATCH_KEYS = ("em", "ph", "fn", "ln", "ct", "st", "zp", "country", "external_id")
+HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _text(value):
+    return value.strip() if isinstance(value, str) else ""
+
+
+def hashed_user_data(email=None, phone=None, first_name=None, last_name=None,
+                     city=None, postcode=None, region=None, country=None,
+                     external_id=None, default_country="GB"):
+    """Meta's customer matching keys, normalised and SHA-256 hashed. The one
+    place this happens, so the browser relay, checkout and order webhooks and
+    the identity store all produce identical hashes for the same person."""
+    country_code = _text(country).upper()
+    data = {}
+    email = _text(email)
+    if "@" in email:
+        data["em"] = [hash_data(email)]
+    # phone may be one number or a list (billing, shipping, customer record).
+    phones = phone if isinstance(phone, (list, tuple)) else [phone]
+    phone_hashes = []
+    for p in phones:
+        # Country-aware, so US/CA numbers get their leading 1.
+        digits = normalize_phone(_text(p), country_code or default_country)
+        if len(digits) >= 10:
+            h = hash_data(digits)
+            if h not in phone_hashes:
+                phone_hashes.append(h)
+    if phone_hashes:
+        data["ph"] = phone_hashes
+    # Names: lowercase letters only, the same rule the theme's pixel uses.
+    for key, raw in (("fn", first_name), ("ln", last_name)):
+        name = re.sub(r"[^a-zà-ɏ]", "", _text(raw).lower())
+        if name:
+            data[key] = [hash_data(name)]
+    # Meta's ct and st format: lowercase letters only, no spaces.
+    for key, raw in (("ct", city), ("st", region)):
+        letters = re.sub(r"[^a-z]", "", _text(raw).lower())
+        if letters:
+            data[key] = [hash_data(letters)]
+    zp = _text(postcode).lower().replace(" ", "").replace("-", "")
+    if country_code == "US":
+        zp = zp[:5]  # US ZIPs are matched on the first 5 digits
+    if zp:
+        data["zp"] = [hash_data(zp)]
+    if re.fullmatch(r"[A-Z]{2}", country_code):
+        data["country"] = [hash_data(country_code.lower())]
+    # external_id may be one ID or a list (visitor ID and Shopify customer ID).
+    ext_ids = external_id if isinstance(external_id, (list, tuple)) else [external_id]
+    ext_hashes = []
+    for e in ext_ids:
+        if e not in (None, ""):
+            h = hash_data(str(e))
+            if h not in ext_hashes:
+                ext_hashes.append(h)
+    if ext_hashes:
+        data["external_id"] = ext_hashes
+    return data
+
+
 def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     email=None, phone=None, first_name=None, last_name=None,
                     city=None, postcode=None, region=None, country=None,
@@ -137,65 +216,39 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     client_ip=None, user_agent=None,
                     external_id=None, content_ids=None, content_type=None,
                     contents=None, num_items=None, order_id=None,
-                    pixel_id=None, access_token=None):
+                    pixel_id=None, access_token=None, matched=None):
 
     PIXEL_ID = pixel_id if pixel_id is not None else os.environ.get("PIXEL_ID")
     ACCESS_TOKEN = access_token if access_token is not None else os.environ.get("ACCESS_TOKEN")
 
-    country_code = (country or "").upper()
+    user_data = hashed_user_data(
+        email=email, phone=phone, first_name=first_name, last_name=last_name,
+        city=city, postcode=postcode, region=region, country=country,
+        external_id=external_id)
 
-    user_data = {}
-    if email:
-        user_data["em"] = [hash_data(email)]
-    # phone may be one number or a list (billing, shipping, customer record).
-    phones = phone if isinstance(phone, (list, tuple)) else [phone]
-    phone_hashes = []
-    for p in phones:
-        # US FIX: pass country so normalization matches Meta's expected format
-        digits = normalize_phone(p, country_code or "GB")
-        if len(digits) >= 10:
-            h = hash_data(digits)
-            if h not in phone_hashes:
-                phone_hashes.append(h)
-    if phone_hashes:
-        user_data["ph"] = phone_hashes
-    if first_name:
-        user_data["fn"] = [hash_data(first_name)]
-    if last_name:
-        user_data["ln"] = [hash_data(last_name)]
-    if city:
-        # US FIX (helps UK too): Meta's ct format is lowercase letters only, no spaces
-        user_data["ct"] = [hash_data(re.sub(r'[^a-z]', '', city.lower()))]
-    if postcode:
-        # US FIX: strip spaces/dashes; US ZIPs hashed as first 5 digits only
-        zp = postcode.lower().replace(" ", "").replace("-", "")
-        if country_code == "US":
-            zp = zp[:5]
-        user_data["zp"] = [hash_data(zp)]
-    if region:
-        user_data["st"] = [hash_data(region.lower())]
-    if country:
-        user_data["country"] = [hash_data(country.lower())]
+    # Hashed keys remembered for this visitor (identity store). Only for events
+    # that carry no identity of their own, so one event never mixes two people.
+    if matched and "em" not in user_data and "ph" not in user_data:
+        for key in MATCH_KEYS:
+            stored = [h for h in (matched.get(key) or []) if isinstance(h, str) and HASH_RE.fullmatch(h)]
+            if not stored:
+                continue
+            if key == "external_id":
+                current = user_data.get(key, [])
+                user_data[key] = (current + [h for h in stored if h not in current])[:5]
+            elif key not in user_data:
+                user_data[key] = stored[:3]
+
     if valid_fbc(fbc):
         user_data["fbc"] = fbc
+    elif valid_fbclid(fbclid):
+        user_data["fbc"] = f"fb.1.{int(time.time() * 1000)}.{fbclid}"
     if valid_fbp(fbp):
         user_data["fbp"] = fbp
-    if fbclid and not fbc:
-        user_data["fbc"] = f"fb.1.{int(time.time() * 1000)}.{fbclid}"
     if client_ip:
         user_data["client_ip_address"] = client_ip
     if user_agent:
         user_data["client_user_agent"] = user_agent
-    # external_id may be one ID or a list (visitor ID and Shopify customer ID).
-    ext_ids = external_id if isinstance(external_id, (list, tuple)) else [external_id]
-    ext_hashes = []
-    for e in ext_ids:
-        if e:
-            h = hash_data(str(e))
-            if h not in ext_hashes:
-                ext_hashes.append(h)
-    if ext_hashes:
-        user_data["external_id"] = ext_hashes
 
     event = {
         "event_name": event_name,
@@ -260,6 +313,262 @@ def verify_shopify_webhook(raw_body, hmac_header):
     return hmac.compare_digest(computed, hmac_header)
 
 
+# ============ STORES ============
+# Everything that differs between stores is resolved here, keyed by the
+# store's permanent *.myshopify.com domain (Shopify sends it on every webhook
+# and the theme sends it on every event). Today every Shopify store uses the
+# Railway variables; the multi-store hub replaces store_config's body with a
+# database lookup and nothing else has to change.
+
+SHOP_DOMAIN_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,60}\.myshopify\.com")
+
+
+def shop_key(value):
+    value = _text(value).lower()
+    return value if SHOP_DOMAIN_RE.fullmatch(value) else None
+
+
+def store_config(shop):
+    return {
+        "shop": shop,
+        "pixel_id": os.environ.get("PIXEL_ID"),
+        "access_token": os.environ.get("ACCESS_TOKEN"),
+        "default_country": os.environ.get("DEFAULT_COUNTRY", "GB"),
+    }
+
+
+def site_origin(url):
+    """https://host of a Shopify URL (order status or checkout recovery link).
+    Only the origin: the rest of those URLs carries access keys."""
+    try:
+        parsed = urlparse(url or "")
+    except ValueError:
+        return None
+    if parsed.scheme == "https" and parsed.hostname:
+        return f"https://{parsed.hostname}"
+    return None
+
+
+def note_attributes(record):
+    """Cart attributes from an order or checkout payload, as a dict."""
+    attrs = {}
+    for item in record.get("note_attributes") or []:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            attrs[item["name"]] = item.get("value") if isinstance(item.get("value"), str) else ""
+    return attrs
+
+
+def buyer_details(record):
+    """Who is buying, from a Shopify order or checkout. Billing is the buyer
+    (often an adult child paying for a parent); shipping fills gaps. Shopify
+    scatters the phone, so every place it keeps one is collected."""
+    billing = record.get("billing_address") or {}
+    shipping = record.get("shipping_address") or {}
+    customer = record.get("customer") or {}
+    address = billing or shipping
+    phones = []
+    for p in (record.get("phone"), billing.get("phone"), customer.get("phone"),
+              record.get("sms_marketing_phone")):
+        if p and p not in phones:
+            phones.append(p)
+    # Shipping phone only as a fallback: the recipient may not be the buyer.
+    if not phones and shipping.get("phone"):
+        phones.append(shipping.get("phone"))
+    return {
+        "email": record.get("email") or customer.get("email") or "",
+        "phone": phones,
+        "first_name": address.get("first_name") or "",
+        "last_name": address.get("last_name") or "",
+        "city": address.get("city") or "",
+        "postcode": address.get("zip") or "",
+        # province_code gives "CA" not "California": the format Meta matches on
+        "region": address.get("province_code") or address.get("province") or "",
+        "country": address.get("country_code") or shipping.get("country_code") or "",
+        "customer_id": customer.get("id"),
+    }
+
+
+def buyer_match(details, default_country="GB"):
+    return hashed_user_data(
+        email=details["email"], phone=details["phone"],
+        first_name=details["first_name"], last_name=details["last_name"],
+        city=details["city"], postcode=details["postcode"], region=details["region"],
+        country=details["country"], external_id=details["customer_id"],
+        default_country=default_country)
+
+
+# ============ IDENTITY STORE ============
+# One row per store and visitor ID, holding only the hashed matching keys Meta
+# already receives (never raw details) plus the browser's last fbc/fbp, user
+# agent and IP. Fed by checkout and order webhooks and by identified browser
+# events; read back to give that visitor's later anonymous events the email
+# and phone they typed at checkout. Joins are exact visitor-ID matches only.
+
+VID_RE = re.compile(r"v_[A-Za-z0-9]{6,40}")
+BROWSER_FRESH = timedelta(days=3)
+
+
+def valid_vid(value):
+    return isinstance(value, str) and bool(VID_RE.fullmatch(value))
+
+
+def init_identity_db():
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        with conn, conn.cursor() as cur:
+            # Both gunicorn workers start at once; the lock stops them racing
+            # each other through CREATE TABLE.
+            cur.execute("SELECT pg_advisory_xact_lock(724501)")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS meta_identity (
+                    shop TEXT NOT NULL,
+                    vid TEXT NOT NULL,
+                    match JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    identified_at TIMESTAMPTZ,
+                    fbc TEXT, fbp TEXT, user_agent TEXT, client_ip TEXT,
+                    browser_seen_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (shop, vid)
+                );
+                CREATE INDEX IF NOT EXISTS meta_identity_updated ON meta_identity (updated_at);
+                CREATE TABLE IF NOT EXISTS meta_checkout_signal (
+                    shop TEXT NOT NULL,
+                    checkout_token TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    sent_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (shop, checkout_token, event_name)
+                );
+            """)
+        conn.close()
+    except Exception as e:
+        logger.error(f"identity init failed: {type(e).__name__}: {e}")
+
+
+init_identity_db()
+
+IDENTITY_UPSERT = """
+INSERT INTO meta_identity AS t
+    (shop, vid, match, identified_at, fbc, fbp, user_agent, client_ip, browser_seen_at, updated_at)
+VALUES (%(shop)s, %(vid)s, %(match)s::jsonb,
+        CASE WHEN %(match)s::jsonb = '{}'::jsonb THEN NULL ELSE now() END,
+        %(fbc)s, %(fbp)s, %(ua)s, %(ip)s,
+        CASE WHEN %(ua)s::text IS NULL THEN NULL ELSE now() END, now())
+ON CONFLICT (shop, vid) DO UPDATE SET
+    -- A different email means a different person on this device: start over
+    -- rather than mix two people's details. Otherwise add to what we know.
+    match = CASE
+        WHEN EXCLUDED.match ? 'em' AND t.match ? 'em' AND t.match->'em' <> EXCLUDED.match->'em'
+        THEN EXCLUDED.match
+        ELSE t.match || EXCLUDED.match END,
+    identified_at = COALESCE(EXCLUDED.identified_at, t.identified_at),
+    fbc = COALESCE(EXCLUDED.fbc, t.fbc),
+    fbp = COALESCE(EXCLUDED.fbp, t.fbp),
+    user_agent = COALESCE(EXCLUDED.user_agent, t.user_agent),
+    client_ip = COALESCE(EXCLUDED.client_ip, t.client_ip),
+    browser_seen_at = COALESCE(EXCLUDED.browser_seen_at, t.browser_seen_at),
+    updated_at = now()
+RETURNING match, fbc, fbp, user_agent, client_ip, browser_seen_at
+"""
+
+IDENTITY_SELECT = """
+SELECT match, fbc, fbp, user_agent, client_ip, browser_seen_at
+FROM meta_identity WHERE shop = %(shop)s AND vid = %(vid)s
+"""
+
+
+def identity_record(shop, vid, match=None, fbc=None, fbp=None,
+                    user_agent=None, client_ip=None, write=True):
+    """Store what we learned about this visitor (write=True) or just read it.
+    Returns the stored row as a dict, or {} on any problem: tracking must
+    never fail because of it."""
+    if not DATABASE_URL or not shop or not valid_vid(vid):
+        return {}
+    match = {k: v for k, v in (match or {}).items() if k in MATCH_KEYS and v}
+    params = {
+        "shop": shop, "vid": vid, "match": json.dumps(match),
+        "fbc": fbc if valid_fbc(fbc) else None,
+        "fbp": fbp if valid_fbp(fbp) else None,
+        "ua": user_agent[:512] if isinstance(user_agent, str) and user_agent else None,
+        "ip": client_ip[:64] if isinstance(client_ip, str) and client_ip else None,
+    }
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+        with conn, conn.cursor() as cur:
+            cur.execute(IDENTITY_UPSERT if write else IDENTITY_SELECT, params)
+            row = cur.fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"identity {'write' if write else 'read'} failed: {type(e).__name__}")
+        return {}
+    if not row:
+        return {}
+    stored, fbc, fbp, ua, ip, seen = row
+    record = {"match": stored or {}, "fbc": fbc, "fbp": fbp}
+    # The browser details only count while recent: they stand in for the
+    # shopper's own device on server events.
+    if seen and datetime.now(timezone.utc) - seen < BROWSER_FRESH:
+        record["user_agent"] = ua
+        record["client_ip"] = ip
+    return record
+
+
+def checkout_signal_claim(shop, token, event_name):
+    """True only for the first caller per checkout and event, so webhook
+    retries and repeated checkout updates never send the event twice.
+    None means storage is down: then nothing is sent."""
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO meta_checkout_signal (shop, checkout_token, event_name)
+                   VALUES (%s,%s,%s) ON CONFLICT DO NOTHING RETURNING 1""",
+                (shop, token, event_name))
+            claimed = cur.fetchone() is not None
+        conn.close()
+        return claimed
+    except Exception as e:
+        logger.error(f"checkout signal claim failed: {type(e).__name__}")
+        return None
+
+
+def checkout_signal_release(shop, token, event_name):
+    """Undo a claim when Meta did not accept the event, so the next checkout
+    update can try again."""
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """DELETE FROM meta_checkout_signal
+                   WHERE shop = %s AND checkout_token = %s AND event_name = %s""",
+                (shop, token, event_name))
+        conn.close()
+    except Exception as e:
+        logger.error(f"checkout signal release failed: {type(e).__name__}")
+
+
+def identity_cleanup():
+    """Anonymous visitors are kept 30 days, identified ones 400 days."""
+    while True:
+        try:
+            conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+            with conn, conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM meta_identity
+                    WHERE (identified_at IS NULL AND updated_at < now() - interval '30 days')
+                       OR updated_at < now() - interval '400 days';
+                    DELETE FROM meta_checkout_signal WHERE sent_at < now() - interval '60 days';
+                    DELETE FROM meta_context WHERE received_at < now() - interval '30 days';
+                """)
+            conn.close()
+        except Exception as e:
+            logger.error(f"identity cleanup failed: {type(e).__name__}")
+        time.sleep(6 * 3600)
+
+
 # Shopify order webhook — fires Purchase event
 @app.route('/webhook/order-created', methods=['POST'])
 def order_created():
@@ -270,11 +579,14 @@ def order_created():
             f"Webhook REJECTED - invalid signature. Source IP: {request.headers.get('X-Forwarded-For', request.remote_addr)}")
         return jsonify({'error': 'unauthorized'}), 401
 
-    order = request.json
+    order = request.get_json(force=True, silent=True)
+    if not isinstance(order, dict):
+        return jsonify({'ok': True, 'ignored': 'invalid_body'}), 200
     logger.info(f"Webhook received for order: {order.get('id')}")
+    shop = shop_key(request.headers.get("X-Shopify-Shop-Domain"))
+    config = store_config(shop)
 
-    note_attributes = order.get("note_attributes", [])
-    attrs = {a["name"]: a["value"] for a in note_attributes}
+    attrs = note_attributes(order)
     fbc = attrs.get("_fbc", "")
     fbp = attrs.get("_fbp", "")
     fbclid = attrs.get("_fbclid", "")
@@ -291,7 +603,7 @@ def order_created():
         fbp = fbp or context.get("fbp") or ""
         fbc = fbc or context.get("fbc") or ""
 
-    if not fbc and not fbclid:
+    if not valid_fbc(fbc) and not valid_fbclid(fbclid):
         landing_site = order.get("landing_site", "") or ""
         raw_query = landing_site.split("?", 1)[1] if "?" in landing_site else ""
         ls_fbclid = None
@@ -308,47 +620,22 @@ def order_created():
         f"Identifiers for order {order_id}: vid={bool(vid)} fbc={bool(fbc)} fbp={bool(fbp)} "
         f"fbclid={bool(fbclid)} from_context={bool(context)} utm_source={utm_source}")
 
-    email = order.get("email", "")
     total_price = order.get("total_price", "0")
+    buyer = buyer_details(order)
+    content_ids, contents, num_items = line_item_contents(order)
 
-    customer = order.get("customer") or {}
-    customer_id = customer.get("id")
-    shipping = order.get("shipping_address") or {}
-    billing_raw = order.get("billing_address") or {}
-
-    # Shopify almost never fills order.phone (0 of the last 50 orders); the
-    # number sits on the billing address, shipping address or customer record.
-    # Billing first: that is the buyer, the shipping phone may be a relative's.
-    phones = []
-    for p in (order.get("phone"), billing_raw.get("phone"), customer.get("phone")):
-        if p and p not in phones:
-            phones.append(p)
-    # Shipping phone only as a fallback: the recipient may not be the buyer.
-    if not phones and shipping.get("phone"):
-        phones.append(shipping.get("phone"))
-
-    line_items = order.get("line_items", [])
-    content_ids = [str(item.get("product_id", ""))
-                   for item in line_items if item.get("product_id")]
-    contents = [{"id": str(item.get("product_id", "")), "quantity": item.get("quantity", 1), "item_price": float(
-        item.get("price", 0))} for item in line_items if item.get("product_id")]
-    num_items = sum(item.get("quantity", 1) for item in line_items)
-
-    billing = order.get("billing_address") or order.get(
-        "shipping_address") or {}
-    first_name = billing.get("first_name", "")
-    last_name = billing.get("last_name", "")
-    city = billing.get("city", "")
-    postcode = billing.get("zip", "")
-    # US FIX: province_code gives "CA" not "California" — the format Meta actually matches on
-    region = billing.get("province_code") or billing.get("province", "")
-    country = billing.get("country_code", "")
+    # Remember this buyer against their visitor ID, so their later visits
+    # carry the email and phone they bought with. The stored row also gives
+    # the browser's user agent and IP when the order has none.
+    known = identity_record(shop, vid, match=buyer_match(buyer, config["default_country"]),
+                            fbc=fbc, fbp=fbp)
 
     # Extract IP and User Agent from Shopify's client_details
     client_details = order.get("client_details") or {}
-    browser_ip = order.get(
-        "browser_ip") or client_details.get("browser_ip", "")
-    browser_ua = client_details.get("user_agent") or context.get("user_agent", "")
+    browser_ip = (order.get("browser_ip") or client_details.get("browser_ip")
+                  or known.get("client_ip") or "")
+    browser_ua = (client_details.get("user_agent") or context.get("user_agent")
+                  or known.get("user_agent") or "")
 
     save_event_db(
         event_name="Purchase",
@@ -363,31 +650,182 @@ def order_created():
         fbc=fbc,
         fbp=fbp,
         fbclid=fbclid,
-        email=email,
-        phone=phones,
-        first_name=first_name,
-        last_name=last_name,
-        city=city,
-        postcode=postcode,
-        region=region,
-        country=country,
+        email=buyer["email"],
+        phone=buyer["phone"],
+        first_name=buyer["first_name"],
+        last_name=buyer["last_name"],
+        city=buyer["city"],
+        postcode=buyer["postcode"],
+        region=buyer["region"],
+        country=buyer["country"],
         value=float(total_price),
-        # US FIX: total_price is always shop currency — pair it with the order's own currency field
+        # total_price is always shop currency; pair it with the order's own currency field
         currency=order.get("currency", "GBP"),
-        source_url="https://comfishop.com",
+        source_url=site_origin(order.get("order_status_url")) or "https://comfishop.com",
         client_ip=browser_ip,
         user_agent=browser_ua,
         # Both IDs: the browser sends the visitor ID, Meta can also join on the
         # customer ID across repeat orders.
-        external_id=[vid, customer_id],
+        external_id=[vid, buyer["customer_id"]],
         content_ids=content_ids,
         content_type="product",
         contents=contents,
         num_items=num_items,
-        order_id=order_id
+        order_id=order_id,
+        pixel_id=config["pixel_id"],
+        access_token=config["access_token"]
     )
 
     return jsonify({'ok': True}), 200
+
+
+def line_item_contents(record):
+    """content_ids, contents and item count from an order or checkout."""
+    content_ids, contents, num_items = [], [], 0
+    for item in record.get("line_items") or []:
+        if not isinstance(item, dict):
+            continue
+        quantity = item.get("quantity") or 1
+        num_items += quantity
+        if not item.get("product_id"):
+            continue
+        product_id = str(item["product_id"])
+        content_ids.append(product_id)
+        try:
+            price = float(item.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        contents.append({"id": product_id, "quantity": quantity, "item_price": price})
+    return content_ids, contents, num_items
+
+
+# ============ CHECKOUT WEBHOOKS ============
+# Shopify's "Checkout creation" and "Checkout update" webhooks fire from
+# Shopify's own servers as soon as a shopper types their details at checkout,
+# so no ad blocker, browser or consent banner can stop them. They carry the
+# email, phone, address and the cart attributes (visitor ID, fbc, fbp).
+#
+# Two things happen with them:
+# 1. The identity store learns who this visitor is (see above).
+# 2. Once per checkout, an AddPaymentInfo event goes to Meta with the full
+#    identity, when the shopper has given contact and delivery details and is
+#    at the payment step. No browser sends AddPaymentInfo, so nothing double
+#    counts. It lets Meta match abandoners nearly as well as buyers, which
+#    feeds retargeting and the delivery algorithm.
+
+CHECKOUT_EVENT = "AddPaymentInfo"
+
+
+@app.route('/webhook/checkout', methods=['POST'])
+def checkout_webhook():
+    raw_body = request.get_data()
+    if not verify_shopify_webhook(raw_body, request.headers.get("X-Shopify-Hmac-Sha256", "")):
+        logger.warning(
+            f"Checkout webhook REJECTED - invalid signature. Source IP: {request.headers.get('X-Forwarded-For', request.remote_addr)}")
+        return jsonify({'error': 'unauthorized'}), 401
+    try:
+        checkout = json.loads(raw_body)
+    except (ValueError, TypeError):
+        return jsonify({'ok': True, 'ignored': 'invalid_json'}), 200
+    if not isinstance(checkout, dict):
+        return jsonify({'ok': True, 'ignored': 'invalid_body'}), 200
+    shop = shop_key(request.headers.get("X-Shopify-Shop-Domain"))
+    try:
+        result = handle_checkout(shop, checkout)
+    except Exception as e:
+        # Always 200: Shopify disables webhooks that keep failing, and a lost
+        # checkout signal must never cost us the order webhooks.
+        logger.error(f"Checkout webhook failed: {type(e).__name__}: {e}")
+        result = "error"
+    return jsonify({'ok': True, 'result': result}), 200
+
+
+def handle_checkout(shop, checkout):
+    config = store_config(shop)
+    token = checkout.get("token")
+    token = token if isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,128}", token) else ""
+    attrs = note_attributes(checkout)
+    vid = attrs.get("_comfi_vid", "")
+    fbc = attrs.get("_fbc", "")
+    fbp = attrs.get("_fbp", "")
+    fbclid = attrs.get("_fbclid", "")
+
+    # Express checkout skips the cart: fall back to what the checkout pixel sent.
+    context = {}
+    if token and not (valid_vid(vid) and valid_fbp(fbp) and valid_fbc(fbc)):
+        context = meta_context_lookup(token)
+        vid = vid if valid_vid(vid) else (context.get("vid") or "")
+        fbp = fbp if valid_fbp(fbp) else (context.get("fbp") or "")
+        fbc = fbc if valid_fbc(fbc) else (context.get("fbc") or "")
+
+    buyer = buyer_details(checkout)
+    match = buyer_match(buyer, config["default_country"])
+    known = identity_record(shop, vid, match=match, fbc=fbc, fbp=fbp)
+    if not valid_fbc(fbc) and fbc_recent(known.get("fbc")):
+        fbc = known.get("fbc")
+    if not valid_fbp(fbp):
+        fbp = known.get("fbp")
+
+    shipping = checkout.get("shipping_address") or {}
+    billing = checkout.get("billing_address") or {}
+    has_contact = "em" in match or "ph" in match
+    has_delivery = any(a.get(f) for a in (shipping, billing) for f in ("address1", "zip"))
+    summary = (f"Checkout {token[:8] or '?'}: shop={shop} vid={valid_vid(vid)} "
+               f"keys={','.join(sorted(match))} fbc={valid_fbc(fbc)} fbp={valid_fbp(fbp)}")
+
+    if not (token and has_contact and has_delivery):
+        logger.info(f"{summary} -> identity only (not at payment step yet)")
+        return "identity"
+
+    # Meta requires the shopper's browser user agent on website events. The
+    # checkout webhook has none, so use the one from this visitor's own
+    # InitiateCheckout or AddToCart (or the checkout pixel). Without it, wait
+    # for a later checkout update rather than send a weak event.
+    user_agent = context.get("user_agent") or known.get("user_agent")
+    if not user_agent:
+        logger.info(f"{summary} -> {CHECKOUT_EVENT} waiting: no browser user agent yet")
+        return "waiting"
+
+    claimed = checkout_signal_claim(shop, token, CHECKOUT_EVENT)
+    if not claimed:
+        logger.info(f"{summary} -> {CHECKOUT_EVENT} {'already sent' if claimed is False else 'skipped: storage down'}")
+        return "already_sent" if claimed is False else "storage_down"
+
+    content_ids, contents, num_items = line_item_contents(checkout)
+    try:
+        value = float(checkout.get("total_price") or 0)
+    except (TypeError, ValueError):
+        value = None
+    # Checkout amounts are in the shopper's currency, not the shop's.
+    currency = checkout.get("presentment_currency")
+    if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
+        currency = checkout.get("currency") if isinstance(checkout.get("currency"), str) else "GBP"
+
+    try:
+        response = send_capi_event(
+            event_name=CHECKOUT_EVENT,
+            event_id=f"addpaymentinfo_{token}",
+            fbc=fbc, fbp=fbp, fbclid=fbclid,
+            email=buyer["email"], phone=buyer["phone"],
+            first_name=buyer["first_name"], last_name=buyer["last_name"],
+            city=buyer["city"], postcode=buyer["postcode"], region=buyer["region"],
+            country=buyer["country"],
+            value=value, currency=currency,
+            source_url=site_origin(checkout.get("abandoned_checkout_url")) or "https://comfishop.com",
+            client_ip=known.get("client_ip"), user_agent=user_agent,
+            external_id=[vid, buyer["customer_id"]],
+            content_ids=content_ids, content_type="product",
+            contents=contents, num_items=num_items,
+            pixel_id=config["pixel_id"], access_token=config["access_token"])
+        delivered = 200 <= response.status_code < 300
+    except Exception as e:
+        logger.error(f"{CHECKOUT_EVENT} send failed: {type(e).__name__}")
+        delivered = False
+    if not delivered:
+        checkout_signal_release(shop, token, CHECKOUT_EVENT)
+        return "send_failed"
+    logger.info(f"{summary} -> {CHECKOUT_EVENT} sent")
+    return "sent"
 
 
 # ============ META CHECKOUT CONTEXT ============
@@ -563,7 +1001,9 @@ def woo_order_created():
 
 BOT_UA = re.compile(
     # "(?<!cu)" keeps real CUBOT-brand phones from matching "bot".
-    r"(?i)((?<!cu)bot(?:[/;)\-\s]|$)|crawl|spider|slurp|externalhit|facebookcatalog|"
+    # "meta-external" is Meta's own ad-review and AI crawlers (meta-externalads,
+    # meta-externalagent, meta-externalfetcher).
+    r"(?i)((?<!cu)bot(?:[/;)\-\s]|$)|crawl|spider|slurp|externalhit|facebookcatalog|meta-external|"
     r"headless|lighthouse|pagespeed|pingdom|uptime|monitor|python-|curl/|wget/|"
     r"postman|go-http-client|okhttp|java/|axios/|node-fetch|scrapy|ahrefs|"
     r"semrush|petalbot|bytespider|gptbot|claudebot|ccbot|perplexity|"
@@ -605,12 +1045,17 @@ def track_event():
             return jsonify({'error': 'WooCommerce credentials not configured'}), 503
         woo_options = {"pixel_id": pixel_id, "access_token": access_token}
 
-    body = request.json
+    # force: the theme posts text/plain, which skips the CORS preflight so the
+    # event survives the page navigating away (checkout clicks).
+    body = request.get_json(force=True, silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'error': 'invalid_body'}), 400
 
     # Get IP from request (Railway uses X-Forwarded-For behind proxy)
     client_ip = request.headers.get(
         "X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
     user_agent = request.headers.get("User-Agent", "")
+    event_name = body.get("event_name")
 
     if woo_options:
         client_ip = body.get("client_ip") or client_ip
@@ -618,46 +1063,131 @@ def track_event():
         woo_options.update({key: body.get(key) for key in (
             "first_name", "last_name", "city", "postcode", "region", "country",
             "content_ids", "content_type", "contents", "num_items")})
+        extras = woo_options
+        shop = "woo"
+    else:
+        extras = browser_extras(body)
+        shop = shop_key(body.get("shop"))
 
     vid = body.get("vid")
 
-    reason = bot_reason(body.get("event_name"), user_agent, body.get("source_url"))
+    reason = bot_reason(event_name, user_agent, body.get("source_url"))
     if reason:
         # 200 so the sender (theme or WordPress relay) treats it as handled.
-        logger.info(f"Skipped bot event: {body.get('event_name')} | {reason}")
+        logger.info(f"Skipped bot event: {event_name} | {reason}")
         return jsonify({'ok': True, 'skipped': 'bot'}), 200
 
+    # Identity store: record who this visitor is when the event says so
+    # (logged-in customer, WooCommerce order), and refresh their browser details
+    # on the steps before checkout, which the checkout webhook relies on.
+    # Everything else only reads.
+    own = hashed_user_data(
+        email=body.get("email"), phone=body.get("phone"),
+        first_name=extras.get("first_name"), last_name=extras.get("last_name"),
+        city=extras.get("city"), postcode=extras.get("postcode"),
+        region=extras.get("region"), country=extras.get("country"))
+    identified = "em" in own or "ph" in own
+    write = identified or event_name in ("AddToCart", "InitiateCheckout")
+    known = identity_record(
+        shop, vid, match=own if identified else None,
+        fbc=body.get("fbc"), fbp=body.get("fbp"),
+        user_agent=user_agent, client_ip=client_ip, write=write)
+
+    restored = body.get("restored")
+    restored = restored if isinstance(restored, str) and re.fullmatch(r"[a-z_,]{1,40}", restored) else ""
     logger.info(
-        f"Browser event received: {body.get('event_name')} | url: {body.get('source_url')} | ref: {body.get('referrer')} | vid: {vid} | fbc: {body.get('fbc')} | fbp: {body.get('fbp')} | fbclid: {body.get('fbclid')}")
+        f"Browser event received: {event_name} | url: {body.get('source_url')} | ref: {body.get('referrer')} | vid: {vid} | fbc: {body.get('fbc')} | fbp: {body.get('fbp')} | fbclid: {body.get('fbclid')}"
+        f" | shop: {shop or '-'} | known: {','.join(sorted(known.get('match') or {})) or '-'}"
+        + (f" | restored: {restored}" if restored else ""))
+
+    value = body.get("value")
+    currency = body.get("currency", "GBP")
+    if not woo_options:  # the signed WooCommerce relay is trusted as it was
+        try:
+            value = float(value) if isinstance(value, (int, float, str)) and not isinstance(value, bool) else None
+        except ValueError:
+            value = None
+        if value is not None and not 0 <= value < 10_000_000:
+            value = None
+        if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
+            currency = "GBP"
+    # Fall back to the click and browser IDs stored for this visitor when the
+    # browser lost its own (Safari's 7-day wipe, ad blockers).
+    fbc = body.get("fbc") if valid_fbc(body.get("fbc")) else (
+        known.get("fbc") if fbc_recent(known.get("fbc")) else None)
+    fbp = body.get("fbp") if valid_fbp(body.get("fbp")) else known.get("fbp")
 
     save_event_db(
-        event_name=body.get("event_name"),
+        event_name=event_name,
         vid=vid,
         url=body.get("source_url"),
         referrer=body.get("referrer"),
-        value=body.get("value"))
+        value=value)
 
+    config = store_config(shop) if not woo_options else {}
     response = send_capi_event(
-        event_name=body.get("event_name"),
+        event_name=event_name,
         event_id=body.get("event_id", f"evt_{int(time.time())}"),
-        fbc=body.get("fbc"),
-        fbp=body.get("fbp"),
+        fbc=fbc,
+        fbp=fbp,
         fbclid=body.get("fbclid"),
         email=body.get("email"),
         phone=body.get("phone"),
-        value=body.get("value"),
-        currency=body.get("currency", "GBP"),
+        value=value,
+        currency=currency,
         source_url=body.get("source_url"),
         client_ip=client_ip,
         user_agent=user_agent,
         external_id=vid,
-        **woo_options
+        matched=known.get("match"),
+        **{k: v for k, v in config.items() if k in ("pixel_id", "access_token")},
+        **extras
     )
 
     if woo_options and not 200 <= response.status_code < 300:
         return jsonify({'error': 'Meta delivery failed'}), 502
 
     return jsonify({'ok': True}), 200
+
+
+def browser_extras(body):
+    """Country and product fields from the storefront theme, checked: this
+    endpoint is public, so only well-formed values reach Meta."""
+    out = {}
+    country = body.get("country")
+    if isinstance(country, str) and re.fullmatch(r"[A-Za-z]{2}", country):
+        out["country"] = country.upper()
+    product_id = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+    def count(value, maximum=9999):
+        return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= maximum
+
+    ids = body.get("content_ids")
+    if isinstance(ids, list):
+        ids = [str(i) for i in ids[:50]
+               if isinstance(i, (str, int)) and not isinstance(i, bool) and product_id.fullmatch(str(i))]
+        if ids:
+            out["content_ids"] = ids
+    if body.get("content_type") in ("product", "product_group"):
+        out["content_type"] = body["content_type"]
+    contents = []
+    for item in body.get("contents") if isinstance(body.get("contents"), list) else []:
+        if not isinstance(item, dict) or not product_id.fullmatch(str(item.get("id", ""))):
+            continue
+        clean = {"id": str(item["id"])}
+        if count(item.get("quantity")):
+            clean["quantity"] = item["quantity"]
+        price = item.get("item_price")
+        if isinstance(price, (int, float)) and not isinstance(price, bool) and 0 <= price < 10_000_000:
+            clean["item_price"] = price
+        contents.append(clean)
+        if len(contents) == 50:
+            break
+    if contents:
+        out["contents"] = contents
+    if count(body.get("num_items")):
+        out["num_items"] = body["num_items"]
+    return out
 
 
 
@@ -1194,6 +1724,9 @@ def google_worker():
 
 if os.environ.get("GOOGLE_TRACKING_ENABLED") == "true" and DATABASE_URL:
     threading.Thread(target=google_worker, name="google-delivery", daemon=True).start()
+
+if DATABASE_URL:
+    threading.Thread(target=identity_cleanup, name="identity-cleanup", daemon=True).start()
 
 
 if __name__ == "__main__":
