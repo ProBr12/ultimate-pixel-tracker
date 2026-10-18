@@ -71,9 +71,51 @@ def money(value, currency):
     return f"{sign}{value:,.0f}" if sign else f"{value:,.0f} {esc(currency)}"
 
 
-def public_host():
-    host = os.environ.get("HUB_PUBLIC_HOST") or request.host
-    return host if re.fullmatch(r"[A-Za-z0-9.-]+(:[0-9]+)?", host or "") else "track.comfishop.com"
+HOST_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+")
+
+
+def hub_host():
+    """The hub's own address, independent of every store: the dashboard and
+    the Shopify webhook URLs live here. Set by the HUB_PUBLIC_HOST Railway
+    variable (today the Railway address; later the hub's own domain)."""
+    host = (os.environ.get("HUB_PUBLIC_HOST") or request.host or "").strip().lower()
+    return host if HOST_RE.fullmatch(host.split(":")[0]) else request.host
+
+
+def tracking_host(store):
+    """Where this store's browser sends events: its own subdomain when set
+    (first-party, so one shared address never appears across many sites),
+    otherwise the hub's address."""
+    return store.get("tracking_host") or hub_host()
+
+
+@bp.before_request
+def stay_on_hub_host():
+    """The dashboard answers on the hub's own address only, so its login and
+    links are never tied to a store's domain."""
+    wanted = (os.environ.get("HUB_PUBLIC_HOST") or "").strip().lower()
+    if wanted and request.host.lower() != wanted and request.method in ("GET", "HEAD"):
+        query = request.query_string.decode()
+        return redirect(f"https://{wanted}{request.path}" + (f"?{query}" if query else ""), code=302)
+    return None
+
+
+_ping_ok = {}
+
+
+def address_reaches_hub(host):
+    """True when https://host/ping is answered by this service (DNS and
+    certificate in place). Successes are remembered for 10 minutes."""
+    if _ping_ok.get(host, 0) > time.time():
+        return True
+    try:
+        r = requests.get(f"https://{host}/ping", timeout=3)
+        ok = r.status_code == 200 and r.json().get("service") == "tracking-hub"
+    except (requests.RequestException, ValueError):
+        ok = False
+    if ok:
+        _ping_ok[host] = time.time() + 600
+    return ok
 
 
 def csrf_token():
@@ -461,6 +503,7 @@ def read_store_form(existing=None):
         "default_country": f.get("default_country", "GB").strip().upper(),
         "currency": f.get("currency", "GBP").strip().upper(),
         "test_event_code": f.get("test_event_code", "").strip().upper() or None,
+        "tracking_host": re.sub(r"^https?://", "", f.get("tracking_host", "").strip().lower()).strip("/") or None,
         "enabled": f.get("enabled") == "on" if existing else True,
     }
     if not 2 <= len(values["name"]) <= 60:
@@ -485,6 +528,9 @@ def read_store_form(existing=None):
         return None, "The country must be a two-letter code, like GB or US."
     if not stores.CURRENCY_RE.fullmatch(values["currency"]):
         return None, "The currency must be a three-letter code, like GBP or USD."
+    if values["tracking_host"] and (not HOST_RE.fullmatch(values["tracking_host"])
+                                    or values["tracking_host"].endswith(".myshopify.com")):
+        return None, "The tracking address must look like track.yourstore.com."
     if values["test_event_code"] and not stores.TEST_CODE_RE.fullmatch(values["test_event_code"]):
         return None, "The test event code looks like TEST12345 (from Events Manager, Test events)."
     return values, None
@@ -518,6 +564,9 @@ Send this store's events to Meta</label>"""
 <input type="text" name="default_country" value="{country}" maxlength="2" required></label>
 <label>Currency<input type="text" name="currency" value="{currency}" maxlength="3" required></label>
 </div>
+<label>Tracking address (optional)<span>A subdomain of the store's own site, like track.yourstore.com, where shoppers'
+browsers send events. The Setup tab shows how to point it at the hub. Leave empty to use the hub's address.</span>
+<input type="text" name="tracking_host" value="{esc(s.get('tracking_host'))}" placeholder="track.yourstore.com"></label>
 <label>Test event code (optional)<span>Events Manager, Test events. Only the hub's test button uses it.</span>
 <input type="text" name="test_event_code" value="{esc(s.get('test_event_code'))}" placeholder="TEST12345"></label>
 {enabled}
@@ -671,7 +720,7 @@ def health_view(store, facts):
 
 def setup_view(store, facts):
     facts = facts or {"receipts": {}, "last_browser": None, "version": None}
-    host = public_host()
+    host = hub_host()
     sid = esc(store["id"])
     receipts = facts["receipts"]
 
@@ -691,7 +740,22 @@ def setup_view(store, facts):
 <form method="post" action="/hub/stores/{sid}/check-pixel">{csrf_field()}<button class="btn quiet small">Check again</button></form>""",
                       waiting=not store["pixel_check_error"])
 
-    code = render_snippet(store, f"https://{host}/track")
+    own = store.get("tracking_host")
+    address_ok = address_reaches_hub(own) if own and own != host else True
+    if own and own != host:
+        address_step = step(address_ok, "Tracking address", (
+            f"{esc(own)} reaches the hub." if address_ok else
+            f"{esc(own)} does not reach the hub yet. DNS can take up to an hour after the record is added."), f"""
+<p>Shoppers' browsers send events to <b>{esc(own)}</b>, a part of the store's own site, so it is first-party and
+never shared with another store.</p>
+<p>1. In Railway, open the tracker service, Settings, Networking, and add <b>{esc(own)}</b> as a custom domain
+(or ask Claude to add it).<br>2. Where the store's domain is managed, add the CNAME record Railway shows.
+This step turns green by itself.</p>""")
+    else:
+        address_step = step(False, "Tracking address", f"Using the hub's address ({esc(host)}).", f"""
+<p>Optional. Give the store its own address, like track.yourstore.com, in
+<a href="/hub/stores/{sid}?tab=settings">Settings</a>, so its events come from its own site.</p>""", optional=True)
+    code = render_snippet(store, f"https://{tracking_host(store)}/track")
     seen = facts["last_browser"]
     current = facts.get("version") == SNIPPET_VERSION
     if seen and current:
@@ -700,6 +764,8 @@ def setup_view(store, facts):
         code_state = f"Events are arriving (last {ago(seen)}), but the theme has older code. Paste this version over it."
     else:
         code_state = "No events from the theme yet."
+    if not address_ok and not seen:
+        code_state += " Paste it once the tracking address above is green, or its events have nowhere to go."
     code_step = step(bool(seen) and current, "Tracking code on the theme", code_state, f"""
 <p>Shopify admin, Online Store, Themes, Edit code, <b>layout/theme.liquid</b>. Paste this right after the
 <code>&lt;head&gt;</code> line and save. Remove any other Meta pixel code first, so the pixel does not load twice.</p>
@@ -738,7 +804,7 @@ Open Events Manager, your pixel, Test events, then press the button.</p>
         test_body = f'<p class="note {"good" if result == "ok" else "bad"}">{esc(request.args.get("msg", ""))}</p>' + test_body
     test_step = step(result == "ok", "Test event", "Sent." if result == "ok" else "Optional.", test_body,
                      optional=True)
-    return f"""<ol class="steps">{pixel_step}{code_step}{hooks_step}{test_step}</ol>"""
+    return f"""<ol class="steps">{pixel_step}{address_step}{code_step}{hooks_step}{test_step}</ol>"""
 
 
 SNIPPET_TEMPLATE = r'''{%- comment -%}
@@ -1302,7 +1368,7 @@ def render_snippet(store, track_url):
 @login_required
 def snippet_download(store_id):
     store = stores.get_store(store_id) or abort(404)
-    return Response(render_snippet(store, f"https://{public_host()}/track"), mimetype="text/plain",
+    return Response(render_snippet(store, f"https://{tracking_host(store)}/track"), mimetype="text/plain",
                     headers={"Content-Disposition": f'attachment; filename="tracking-{store["id"]}.liquid"'})
 
 

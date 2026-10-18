@@ -1102,6 +1102,12 @@ def bot_reason(event_name, user_agent, source_url):
     return None
 
 
+# Lets the hub confirm a store's tracking address reaches this service.
+@app.route('/ping')
+def ping():
+    return jsonify({'ok': True, 'service': 'tracking-hub'}), 200
+
+
 # Browser event relay
 @app.route('/track', methods=['POST'])
 def track_event():

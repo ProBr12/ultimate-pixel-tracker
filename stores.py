@@ -111,6 +111,9 @@ CREATE TABLE IF NOT EXISTS meta_deliveries (
     restored TEXT
 );
 CREATE INDEX IF NOT EXISTS meta_deliveries_shop_ts ON meta_deliveries (shop, ts DESC);
+-- Where the store's browser sends its events, e.g. track.yourstore.com (a
+-- subdomain of the store's own site pointed at the hub). Empty: the hub's address.
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS tracking_host TEXT;
 CREATE TABLE IF NOT EXISTS hub_migrations (
     name TEXT PRIMARY KEY,
     done_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -123,6 +126,7 @@ CREATE TABLE IF NOT EXISTS hub_migrations (
 FIRST_STORE = {
     "id": "comfi-uk", "name": "Comfi UK", "shop_domain": "v8284i-f1.myshopify.com",
     "site_url": "https://comfishop.com", "default_country": "GB", "currency": "GBP",
+    "tracking_host": "track.comfishop.com",
 }
 
 
@@ -143,6 +147,12 @@ def init_store_db():
                        ON CONFLICT DO NOTHING""",
                     dict(FIRST_STORE, pixel=os.environ["PIXEL_ID"]))
                 logger.info(f"Store registry: added {FIRST_STORE['name']} from the Railway variables")
+            # Once: Comfi's theme already sends to its own subdomain; record it.
+            cur.execute("""INSERT INTO hub_migrations (name) VALUES ('first_store_tracking_host')
+                           ON CONFLICT DO NOTHING RETURNING 1""")
+            if cur.fetchone():
+                cur.execute("UPDATE stores SET tracking_host = %s WHERE id = %s AND tracking_host IS NULL",
+                            (FIRST_STORE["tracking_host"], FIRST_STORE["id"]))
     except Exception as e:
         logger.error(f"store registry init failed: {type(e).__name__}: {e}")
 
@@ -195,7 +205,7 @@ CACHE_SECONDS = 30
 STORE_COLUMNS = ("id", "account_id", "platform", "name", "shop_domain", "site_url", "pixel_id",
                  "access_token_enc", "webhook_secret_enc", "test_event_code", "default_country",
                  "currency", "enabled", "uses_env_credentials", "pixel_name", "pixel_checked_at",
-                 "pixel_check_error", "created_at", "updated_at")
+                 "pixel_check_error", "created_at", "updated_at", "tracking_host")
 
 
 def _row_to_store(row):
@@ -262,7 +272,7 @@ def get_store(store_id):
 def save_store(values, store_id=None):
     """Insert or update a store from already-validated values. Credentials are
     only replaced when a new one is given (blank keeps the stored one)."""
-    fields = {k: values[k] for k in ("name", "shop_domain", "site_url", "pixel_id", "test_event_code",
+    fields = {k: values[k] for k in ("name", "shop_domain", "site_url", "pixel_id", "test_event_code", "tracking_host",
                                      "default_country", "currency", "enabled") if k in values}
     if values.get("access_token"):
         fields["access_token_enc"] = encrypt(values["access_token"])
