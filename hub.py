@@ -19,10 +19,13 @@ from urllib.parse import urlparse
 
 import requests
 from flask import Blueprint, Response, abort, redirect, request, session
+from phonenumbers import PhoneMetadata
 
+import alerts
 import stores
 
-SNIPPET_VERSION = 6
+SNIPPET_VERSION = 7
+CHECKOUT_PIXEL_VERSION = 3
 bp = Blueprint("hub", __name__, url_prefix="/hub")
 _send_capi_event = None
 
@@ -30,6 +33,7 @@ _send_capi_event = None
 def register(app, send_capi_event):
     global _send_capi_event
     _send_capi_event = send_capi_event
+    alerts.start(store_facts, store_status)
     key = stores.session_secret()
     if key:
         app.secret_key = key
@@ -282,6 +286,7 @@ def page(title, content, active=None, bare=False):
 <a class="brand" href="/hub">Tracking hub<small>Meta signal for every store</small></a>
 <nav aria-label="Stores">{rack}</nav>
 <a class="btn quiet small add" href="/hub/stores/new">Add a store</a>
+<a class="btn quiet small add" href="/hub/alerts">Alerts</a>
 <form method="post" action="/hub/logout">{csrf_field()}<button class="btn quiet small">Log out</button></form>
 </aside><main>{content}</main></div><script>{COPY_JS}</script></body></html>""")
 
@@ -358,7 +363,7 @@ FUNNEL_ORDER = ["PageView", "ViewContent", "AddToCart", "InitiateCheckout", "Add
 def store_facts(shop):
     """Everything the status, health and setup views need about one store."""
     facts = {"events": [], "errors": [], "receipts": {}, "last_browser": None, "version": None,
-             "total": 0, "accepted": 0, "purchases": 0, "apinfo_7d": 0, "restores_7d": 0, "identified": 0}
+             "checkout_pixel_seen": None, "checkout_pixel_version": None, "total": 0, "accepted": 0, "purchases": 0, "apinfo_7d": 0, "restores_7d": 0, "identified": 0}
     if not shop:
         return facts
     key_sql = ", ".join("count(*) FILTER (WHERE %s = ANY(keys))" for _ in KEY_COLUMNS)
@@ -394,6 +399,9 @@ def store_facts(shop):
         facts["errors"] = cur.fetchall()
         cur.execute("SELECT topic, last_at, total, last_result FROM webhook_receipts WHERE shop = %s", (shop,))
         facts["receipts"] = {t: {"last_at": a, "total": n, "result": r} for t, a, n, r in cur.fetchall()}
+        cur.execute("""SELECT received_at, client_version FROM meta_context WHERE shop = %s
+                       ORDER BY received_at DESC LIMIT 1""", (shop,))
+        facts["checkout_pixel_seen"], facts["checkout_pixel_version"] = cur.fetchone() or (None, None)
         try:
             cur.execute("SELECT count(*) FROM meta_identity WHERE shop = %s AND identified_at IS NOT NULL", (shop,))
             facts["identified"] = cur.fetchone()[0]
@@ -602,8 +610,94 @@ def new_store():
             stores.record_pixel_check(values["id"], name, problem)
             return redirect(f"/hub/stores/{values['id']}?tab=setup")
     return page("Add a store", f"""<h1>Add a store</h1>
-<p class="sub">About ten minutes: fill this in, paste the tracking code, add three webhooks. The Setup tab checks each step for you.</p>
+<p class="sub">About ten minutes: fill this in, paste the tracking code and the checkout pixel, add three webhooks. The Setup tab checks each step for you.</p>
 {store_form(None, error)}""")
+
+
+# ============ ALERTS ============
+
+ALERT_NOTICES = {
+    "saved": ("good", "Saved."),
+    "found": ("good", "Found your chat and saved it. Now send a test alert."),
+    "test_ok": ("good", "Test alert sent. It should be on your phone now."),
+}
+
+
+@bp.route("/alerts", methods=["GET", "POST"])
+@login_required
+def alerts_page():
+    try:
+        config = alerts.load_config()
+    except Exception:
+        config = {}
+    notice = ALERT_NOTICES.get(request.args.get("done"))
+    error = ""
+    if request.method == "POST":
+        check_csrf()
+        action = request.form.get("action", "save")
+        token = request.form.get("bot_token", "").strip() or config.get("bot_token", "")
+        chat_id = request.form.get("chat_id", "").strip()
+        new = {"bot_token": token, "chat_id": chat_id, "enabled": request.form.get("enabled") == "on"}
+        if not alerts.BOT_TOKEN_RE.fullmatch(token):
+            error = "That bot token does not look right. Copy it again from @BotFather (it looks like 123456789:AA…)."
+        elif action == "find":
+            found, problem = alerts.find_chat_id(token)
+            if found:
+                new.update(chat_id=found, enabled=True)
+            else:
+                error = problem
+        elif chat_id and not alerts.CHAT_ID_RE.fullmatch(chat_id):
+            error = "The chat ID is a number (sometimes starting with a minus sign). Use “Find my chat ID”."
+        if not error and action == "test" and not new["chat_id"]:
+            error = "Add the chat ID first (press “Find my chat ID”)."
+        if not error and action == "test":
+            ok, problem = alerts.telegram_send(new, "✅ Test alert from your tracking hub. Alerts will arrive here.")
+            if not ok:
+                error = f"Telegram refused it: {problem}"
+        if not error:
+            try:
+                stores.save_setting(alerts.SETTING, new)
+            except stores.HubNotConfigured:
+                return setup_needed_page()
+            done = {"find": "found", "test": "test_ok"}.get(action, "saved")
+            return redirect(f"/hub/alerts?done={done}")
+        config = dict(new, bot_token=token)
+    if alerts.ready(config):
+        state = '<span class="status ok"><i class="dot ok" aria-hidden="true"></i>On: alerts go to your Telegram</span>'
+    elif config.get("bot_token"):
+        state = '<span class="status setup"><i class="dot setup" aria-hidden="true"></i>Not on yet</span>'
+    else:
+        state = '<span class="status setup"><i class="dot setup" aria-hidden="true"></i>Not set up</span>'
+    message = (f'<p class="note bad">{esc(error)}</p>' if error else
+               f'<p class="note {notice[0]}">{esc(notice[1])}</p>' if notice else "")
+    saved_token = "<span>A token is saved. Leave empty to keep it.</span>" if config.get("bot_token") else ""
+    return page("Alerts", f"""<h1>Alerts</h1>
+<p class="sub">A Telegram message when a store turns red, and another when it is back to normal.</p>
+{state}
+<h2>How it works</h2>
+<p>Every 10 minutes the hub checks each store. You get one message when a store goes from fine to red, at most one
+every 6 hours per store, and one when it recovers. Stores still being set up never send alerts.</p>
+<h2>Set up (about 3 minutes)</h2>
+<ol class="steps">
+<li><div><h3>Make a bot</h3><p>In Telegram, open a chat with <b>@BotFather</b>, send <code>/newbot</code>, and pick
+any name and username. It replies with a token: paste it below.</p></div></li>
+<li><div><h3>Say hello to your bot</h3><p>Tap the link BotFather gives you (t.me/yourbot) and press <b>Start</b>.
+For a group instead, add the bot to the group and send a message there.</p></div></li>
+<li><div><h3>Find your chat and test</h3><p>Press <b>Find my chat ID</b>, then <b>Send test alert</b>.</p></div></li>
+</ol>
+<h2>Telegram</h2>
+{message}
+<form class="fields" method="post" autocomplete="off">{csrf_field()}
+<label>Bot token<span>From @BotFather. {saved_token}</span>
+<input type="password" name="bot_token"></label>
+<label>Chat ID<span>Filled in by “Find my chat ID”.</span>
+<input type="text" name="chat_id" value="{esc(config.get('chat_id'))}" inputmode="numeric"></label>
+<label class="check"><input type="checkbox" name="enabled" {'checked' if config.get('enabled') else ''}>
+Send alerts</label>
+<div class="row"><div><button class="btn" name="action" value="save">Save</button></div></div>
+<div><button class="btn quiet small" name="action" value="find">Find my chat ID</button>
+<button class="btn quiet small" name="action" value="test">Send test alert</button></div>
+</form>""")
 
 
 # ============ STORE PAGE ============
@@ -773,6 +867,31 @@ This step turns green by itself.</p>""")
 <p><button class="btn small" type="button" data-copy="snippet">Copy code</button>
 <a class="btn quiet small" href="/hub/stores/{sid}/snippet.liquid">Download</a></p>""")
 
+    pixel_code = render_checkout_pixel(store, f"https://{tracking_host(store)}/meta/context")
+    pixel_seen = facts.get("checkout_pixel_seen")
+    pixel_current = facts.get("checkout_pixel_version") == CHECKOUT_PIXEL_VERSION
+    if pixel_seen and pixel_current:
+        pixel_seen_state = f"Running the latest checkout pixel. Last seen {ago(pixel_seen)}."
+    elif pixel_seen:
+        pixel_seen_state = (f"A checkout pixel is reporting (last {ago(pixel_seen)}), but an older version. "
+                            "Paste this version over it.")
+    else:
+        pixel_seen_state = ("Not seen yet. It reports when a shopper reaches checkout, so it turns green after "
+                            "the first checkout (a test checkout you abandon is enough).")
+    checkout_pixel_step = step(bool(pixel_seen) and pixel_current, "Checkout pixel", pixel_seen_state, f"""
+<p>Sends the browser side of each Purchase (paired with the server's, so Meta counts the sale once) and links
+Buy-it-now and express checkouts, which skip the cart, to the shopper's visit.</p>
+<p>1. Shopify admin, <b>Settings</b>, <b>Customer events</b>.<br>
+2. If a Meta checkout pixel from the hub is already there, open it. Otherwise press <b>Add custom pixel</b>
+and name it “Meta checkout (tracking hub)”.<br>
+3. Under Customer privacy, keep the settings Shopify suggests unless you already use others for marketing pixels.<br>
+4. Delete everything in the code box, paste the code below, press <b>Save</b>, then <b>Connect</b>.</p>
+<p class="muted">Use one hub checkout pixel per store. If you replace an older one, edit it rather than adding a
+second, so the browser Purchase is not sent twice.</p>
+<textarea class="code" id="checkout-pixel" readonly spellcheck="false">{esc(pixel_code)}</textarea>
+<p><button class="btn small" type="button" data-copy="checkout-pixel">Copy code</button>
+<a class="btn quiet small" href="/hub/stores/{sid}/checkout-pixel.js">Download</a></p>""")
+
     def hook_row(topic, label):
         r = receipts.get(topic)
         if r and r["result"] == "bad_signature":
@@ -804,7 +923,7 @@ Open Events Manager, your pixel, Test events, then press the button.</p>
         test_body = f'<p class="note {"good" if result == "ok" else "bad"}">{esc(request.args.get("msg", ""))}</p>' + test_body
     test_step = step(result == "ok", "Test event", "Sent." if result == "ok" else "Optional.", test_body,
                      optional=True)
-    return f"""<ol class="steps">{pixel_step}{address_step}{code_step}{hooks_step}{test_step}</ol>"""
+    return f"""<ol class="steps">{pixel_step}{address_step}{code_step}{checkout_pixel_step}{hooks_step}{test_step}</ol>"""
 
 
 SNIPPET_TEMPLATE = r'''{%- comment -%}
@@ -926,14 +1045,7 @@ s.parentNode.insertBefore(t,s)}(window, document,'script',
 // em: null / ph: null here, which Meta flags as broken advanced matching.
 (function () {
   function clean(v) { return v == null ? "" : String(v).trim().toLowerCase(); }
-  function phone(v, country) {
-    var d = clean(v).replace(/[^\d]/g, "");
-    if (!d) return "";
-    if (country === "us" || country === "ca") return d.length === 10 ? "1" + d : d;
-    if (d.indexOf("44") === 0) return d;
-    if (d.indexOf("0") === 0) return "44" + d.slice(1);
-    return d;
-  }
+__PHONE_JS__
   var raw = {% if customer %}{
     em: {{ customer.email | json }},
     ph: {{ customer.phone | json }},
@@ -948,7 +1060,9 @@ s.parentNode.insertBefore(t,s)}(window, document,'script',
   var country = clean(raw.country || {{ localization.country.iso_code | json }});
   if (country) m.country = country;
   if (clean(raw.em)) m.em = clean(raw.em);
-  if (phone(raw.ph, country)) m.ph = phone(raw.ph, country);
+  // With its country code, read like the server does; left out if unsure.
+  var ph = metaPhone(raw.ph, country || __DEFAULT_COUNTRY__);
+  if (ph) m.ph = ph;
   function name(v) { return clean(v).replace(/[^a-zà-ɏ]/g, ""); }
   if (name(raw.fn)) m.fn = name(raw.fn);
   if (name(raw.ln)) m.ln = name(raw.ln);
@@ -1356,12 +1470,237 @@ src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1"
 '''
 
 
+# ============ PHONE NUMBERS IN THE BROWSER ============
+# The server reads phone numbers with libphonenumber (main.normalize_phone).
+# The browser cannot load that library, so it gets a small table built from
+# the same data: per country, [calling code, trunk prefix, shortest and
+# longest national number, international prefix when not "00"]. A number is
+# only sent with its country code; anything unclear is left out.
+
+PHONE_COUNTRIES = ("GB", "IE", "US", "CA", "AU", "NZ", "DE", "FR", "ES", "IT", "NL", "BE", "LU", "AT", "CH",
+                   "SE", "NO", "DK", "FI", "PT", "PL", "CZ", "GR", "AE", "SA", "QA", "KW", "BH", "OM", "IL",
+                   "ZA", "IN", "PK", "SG", "HK", "MY", "JP", "MX", "BR")
+
+
+def phone_rules():
+    rules = {}
+    for region in PHONE_COUNTRIES:
+        meta = PhoneMetadata.metadata_for_region(region)
+        lengths = meta.general_desc.possible_length
+        rule = [str(meta.country_code), meta.national_prefix or "", min(lengths), max(lengths)]
+        idd = meta.preferred_international_prefix or meta.international_prefix or ""
+        if re.fullmatch(r"[0-9]+", idd) and idd != "00":
+            rule.append(idd)
+        rules[region] = rule
+    return rules
+
+
+PHONE_RULES_JSON = json.dumps(phone_rules(), separators=(",", ":"))
+
+# ES5 and free of "<" so the same code runs in the theme and in Shopify's
+# custom pixel editor (which rejects that character).
+PHONE_JS = r'''  var PHONE_RULES = __PHONE_RULES__;
+  function metaPhone(value, country) {
+    var text = String(value == null ? "" : value).trim();
+    var digits = text.replace(/[^\d]/g, "");
+    if (!digits || text.length > 40) return "";
+    function fits(rule, length) { return length >= rule[2] && rule[3] >= length; }
+    function international(d) {
+      for (var code in PHONE_RULES) {
+        var r = PHONE_RULES[code];
+        if (d.indexOf(r[0]) === 0) return fits(r, d.length - r[0].length) ? d : "";
+      }
+      return d.length >= 8 && 15 >= d.length ? d : "";
+    }
+    if (text.charAt(0) === "+") return international(digits);
+    var rule = PHONE_RULES[String(country || "").toUpperCase()];
+    if (!rule) return "";
+    var idd = rule[4] || "00";
+    if (digits.indexOf(idd) === 0) return international(digits.slice(idd.length));
+    var cc = rule[0], trunk = rule[1], n = digits;
+    if (trunk && n.indexOf(trunk) === 0 && fits(rule, n.length - trunk.length)) {
+      n = n.slice(trunk.length);
+    } else if (n.indexOf(cc) === 0 && !fits(rule, n.length) && fits(rule, n.length - cc.length)) {
+      n = n.slice(cc.length);
+    }
+    return fits(rule, n.length) ? cc + n : "";
+  }'''.replace("__PHONE_RULES__", PHONE_RULES_JSON)
+
+
+def safe_store_name(store):
+    return re.sub(r"[^A-Za-z0-9 &'.-]", "", store["name"] or "")[:60]
+
+
 def render_snippet(store, track_url):
-    name = re.sub(r"[^A-Za-z0-9 &'.-]", "", store["name"] or "")[:60]
-    return (SNIPPET_TEMPLATE.replace("__PIXEL_ID__", store["pixel_id"] or "")
+    return (SNIPPET_TEMPLATE.replace("__PHONE_JS__", PHONE_JS)
+            .replace("__PIXEL_ID__", store["pixel_id"] or "")
             .replace("__TRACK_URL__", track_url)
             .replace("__VERSION__", str(SNIPPET_VERSION))
-            .replace("__STORE_NAME__", name))
+            .replace("__DEFAULT_COUNTRY__", json.dumps(store.get("default_country") or "GB"))
+            .replace("__STORE_NAME__", safe_store_name(store)))
+
+
+# ============ CHECKOUT PIXEL ============
+# Pasted once per store into Shopify admin, Settings, Customer events, as a
+# custom pixel. Two jobs: the browser Purchase that pairs with the server's
+# (same event ID, so Meta counts one), and checkout context (visitor ID,
+# fbp/fbc, user agent) for orders that skip the cart, like Buy it now.
+# Shopify's editor rejects any "<" and lines starting with "?"; the tests
+# check both and run JSHint on the generated code.
+
+CHECKOUT_PIXEL_TEMPLATE = r'''// __STORE_NAME__ Meta checkout pixel v__VERSION__, generated by the tracking hub.
+// Shopify admin, Settings, Customer events, custom pixel. Re-paste from the
+// hub's Setup tab when it says this code is out of date.
+const PIXEL_ID = __PIXEL_ID__;
+const CONTEXT_URL = __CONTEXT_URL__;
+const SHOP = __SHOP__;
+const DEFAULT_COUNTRY = __DEFAULT_COUNTRY__;
+const VERSION = __VERSION__;
+
+// Shopify tells the pixel which store it runs on. Pasted into another store
+// by mistake, this code does nothing rather than send that store's sales here.
+const shopInfo = (typeof init !== "undefined" && init && init.data && init.data.shop) || {};
+const thisShop = String(shopInfo.myshopifyDomain || SHOP).toLowerCase();
+
+__PHONE_JS__
+
+async function sha256(text) {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function safe(promise) { try { return (await promise) || null; } catch (e) { return null; } }
+async function readIdentifiers() {
+  return {
+    vid: await safe(browser.localStorage.getItem("comfi_vid")),
+    fbp: await safe(browser.cookie.get("_fbp")),
+    fbc: await safe(browser.cookie.get("_fbc"))
+  };
+}
+function orderIdOf(checkout) {
+  const raw = checkout && checkout.order && checkout.order.id;
+  return raw ? String(raw).replace("gid://shopify/Order/", "") : null;
+}
+
+const sentContext = {};
+async function sendContext(event) {
+  try {
+    const checkout = (event.data && event.data.checkout) || {};
+    const token = checkout.token;
+    if (!token) return;
+    const ids = await readIdentifiers();
+    const orderId = orderIdOf(checkout);
+    const key = [token, orderId, ids.vid, ids.fbp, ids.fbc].join("|");
+    if (sentContext[key]) return;
+    sentContext[key] = true;
+    await fetch(CONTEXT_URL, {
+      method: "POST", headers: { "Content-Type": "text/plain" }, keepalive: true,
+      body: JSON.stringify({ checkout_token: token, order_id: orderId, vid: ids.vid, fbp: ids.fbp, fbc: ids.fbc,
+        user_agent: navigator.userAgent, shop: thisShop, v: VERSION })
+    });
+  } catch (e) { /* tracking must never interrupt checkout */ }
+}
+
+function loadMetaPixel() {
+  if (window.fbq) return;
+  const fbq = function () { if (fbq.callMethod) { fbq.callMethod.apply(fbq, arguments); } else { fbq.queue.push(arguments); } };
+  window.fbq = fbq; window._fbq = fbq; fbq.push = fbq; fbq.loaded = true; fbq.version = "2.0"; fbq.queue = [];
+  const script = document.createElement("script");
+  script.async = true;
+  script.src = "https://connect.facebook.net/en_US/fbevents.js";
+  const first = document.getElementsByTagName("script")[0];
+  if (first && first.parentNode) { first.parentNode.insertBefore(script, first); } else { document.head.appendChild(script); }
+}
+function clean(text) { return String(text || "").trim().toLowerCase(); }
+// The same rules as the server, so browser and server hash identical values.
+function letters(text) { return clean(text).replace(/[^a-zà-ɏ]/g, ""); }
+
+async function sendPurchase(event) {
+  try {
+    const checkout = event.data && event.data.checkout;
+    const orderId = orderIdOf(checkout);
+    if (!orderId) return;
+    const value = Number(checkout.totalPrice && checkout.totalPrice.amount);
+    const currency = (checkout.totalPrice && checkout.totalPrice.currencyCode) || checkout.currencyCode;
+    const billing = checkout.billingAddress || {};
+    const shipping = checkout.shippingAddress || {};
+    const pick = (field) => billing[field] || shipping[field] || "";
+    const country = String(pick("countryCode")).toUpperCase();
+    const userData = {};
+    const email = clean(checkout.email);
+    if (email.indexOf("@") !== -1) { userData.em = email; }
+    // The buyer's own numbers first, the recipient's (shipping) last.
+    const customer = (checkout.order && checkout.order.customer) || {};
+    const phoneSources = [checkout.phone, billing.phone, customer.phone, checkout.smsMarketingPhone, shipping.phone];
+    for (const source of phoneSources) {
+      const phone = metaPhone(source, country || DEFAULT_COUNTRY);
+      if (phone) { userData.ph = phone; break; }
+    }
+    const firstName = letters(pick("firstName"));
+    const lastName = letters(pick("lastName"));
+    if (firstName) { userData.fn = firstName; }
+    if (lastName) { userData.ln = lastName; }
+    const city = clean(pick("city")).replace(/[^a-z]/g, "");
+    if (city) { userData.ct = city; }
+    const region = clean(pick("provinceCode")).replace(/[^a-z]/g, "");
+    if (region) { userData.st = region; }
+    let zip = clean(pick("zip")).replace(/[\s-]/g, "");
+    if (country === "US") { zip = zip.slice(0, 5); }
+    if (zip) { userData.zp = zip; }
+    if (/^[A-Z]{2}$/.test(country)) { userData.country = country.toLowerCase(); }
+    const ids = await readIdentifiers();
+    if (ids.vid) { userData.external_id = await sha256(clean(ids.vid)); }
+    const contents = [];
+    let numItems = 0;
+    (checkout.lineItems || []).forEach((item) => {
+      const product = item.variant && item.variant.product;
+      const productId = product && product.id ? String(product.id).replace("gid://shopify/Product/", "") : null;
+      const quantity = item.quantity || 1;
+      numItems += quantity;
+      if (productId) {
+        contents.push({ id: productId, quantity: quantity, item_price: Number(item.variant.price && item.variant.price.amount) || 0 });
+      }
+    });
+    loadMetaPixel();
+    window.fbq("init", PIXEL_ID, userData);
+    const params = { value: value, currency: currency, order_id: orderId };
+    if (contents.length) {
+      params.contents = contents;
+      params.content_ids = contents.map((c) => c.id);
+      params.content_type = "product";
+      params.num_items = numItems;
+    }
+    // Same event ID as the server's Purchase, so Meta counts the sale once.
+    window.fbq("track", "Purchase", params, { eventID: "purchase_" + orderId });
+  } catch (e) { /* tracking must never interrupt checkout */ }
+}
+
+if (thisShop === SHOP) {
+  ["checkout_started", "checkout_contact_info_submitted", "checkout_address_info_submitted",
+    "checkout_shipping_info_submitted", "payment_info_submitted", "checkout_completed"
+  ].forEach((name) => analytics.subscribe(name, sendContext));
+  analytics.subscribe("checkout_completed", sendPurchase);
+}
+'''
+
+
+def render_checkout_pixel(store, context_url):
+    return (CHECKOUT_PIXEL_TEMPLATE.replace("__PHONE_JS__", PHONE_JS)
+            .replace("__PIXEL_ID__", json.dumps(store["pixel_id"] or ""))
+            .replace("__CONTEXT_URL__", json.dumps(context_url))
+            .replace("__SHOP__", json.dumps(store["shop_domain"] or ""))
+            .replace("__DEFAULT_COUNTRY__", json.dumps(store.get("default_country") or "GB"))
+            .replace("__VERSION__", str(CHECKOUT_PIXEL_VERSION))
+            .replace("__STORE_NAME__", safe_store_name(store)))
+
+
+@bp.route("/stores/<store_id>/checkout-pixel.js")
+@login_required
+def checkout_pixel_download(store_id):
+    store = stores.get_store(store_id) or abort(404)
+    return Response(render_checkout_pixel(store, f"https://{tracking_host(store)}/meta/context"),
+                    mimetype="text/plain",
+                    headers={"Content-Disposition": f'attachment; filename="checkout-pixel-{store["id"]}.js"'})
 
 
 @bp.route("/stores/<store_id>/snippet.liquid")

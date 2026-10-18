@@ -27,6 +27,7 @@ CORS(app)
 
 # ============ DATABASE LAYER ============
 import psycopg2
+import phonenumbers
 from urllib.parse import urlparse, parse_qs
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -173,24 +174,29 @@ def fbc_recent(value, days=90):
     return time.time() * 1000 - created_ms < days * 86400 * 1000
 
 
+PHONE_REGIONS = phonenumbers.SUPPORTED_REGIONS
+
+
 def normalize_phone(phone, country="GB"):
-    """US FIX: country-aware phone normalization.
-    Meta hashes phones WITH country code. US/CA 10-digit numbers get a leading 1.
-    UK behaviour unchanged."""
-    digits = re.sub(r'[^\d]', '', phone or "")
-    if not digits:
-        return digits
-    country = (country or "GB").upper()
-    if country in ("US", "CA"):
-        if len(digits) == 10:
-            return "1" + digits
-        return digits
-    # UK default
-    if digits.startswith('44'):
-        return digits
-    if digits.startswith('0'):
-        return '44' + digits[1:]
-    return digits
+    """The phone number in Meta's format: E.164 digits without the "+"
+    ("07767 304185" in GB is 447767304185), read with Google's
+    libphonenumber for every country. country is the region a number without
+    its own country code belongs to (the address's country, else the store's).
+    A number that cannot be a real phone number returns "" rather than a
+    wrong hash."""
+    text = phone.strip() if isinstance(phone, str) else ""
+    if not re.search(r"\d", text) or len(text) > 40:
+        return ""
+    region = (country or "").upper()
+    try:
+        number = phonenumbers.parse(text, region if region in PHONE_REGIONS else None)
+    except phonenumbers.NumberParseException:
+        return ""  # no country code and no known country: never guess one
+    # Possible as a whole number: not a local-only fragment missing its area
+    # code. (Not "valid", which would drop numbers in newly issued ranges.)
+    if phonenumbers.is_possible_number_with_reason(number) != phonenumbers.ValidationResult.IS_POSSIBLE:
+        return ""
+    return phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164)[1:]
 
 
 MATCH_KEYS = ("em", "ph", "fn", "ln", "ct", "st", "zp", "country", "external_id")
@@ -216,9 +222,9 @@ def hashed_user_data(email=None, phone=None, first_name=None, last_name=None,
     phones = phone if isinstance(phone, (list, tuple)) else [phone]
     phone_hashes = []
     for p in phones:
-        # Country-aware, so US/CA numbers get their leading 1.
+        # Read in the buyer's country, else the store's (see normalize_phone).
         digits = normalize_phone(_text(p), country_code or default_country)
-        if len(digits) >= 10:
+        if digits:
             h = hash_data(digits)
             if h not in phone_hashes:
                 phone_hashes.append(h)
@@ -262,7 +268,7 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     external_id=None, content_ids=None, content_type=None,
                     contents=None, num_items=None, order_id=None,
                     pixel_id=None, access_token=None, matched=None,
-                    test_event_code=None, log=None):
+                    test_event_code=None, log=None, default_country="GB"):
 
     PIXEL_ID = pixel_id if pixel_id is not None else os.environ.get("PIXEL_ID")
     ACCESS_TOKEN = access_token if access_token is not None else os.environ.get("ACCESS_TOKEN")
@@ -270,7 +276,7 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
     user_data = hashed_user_data(
         email=email, phone=phone, first_name=first_name, last_name=last_name,
         city=city, postcode=postcode, region=region, country=country,
-        external_id=external_id)
+        external_id=external_id, default_country=default_country)
 
     # Hashed keys remembered for this visitor (identity store). Only for events
     # that carry no identity of their own, so one event never mixes two people.
@@ -743,6 +749,7 @@ def order_created():
         order_id=order_id,
         pixel_id=config["pixel_id"],
         access_token=config["access_token"],
+        default_country=config["default_country"],
         log={"shop": shop, "source": "webhook"}
     )
     stores.note_webhook(shop, "orders/create", "purchase_sent")
@@ -888,6 +895,7 @@ def handle_checkout(shop, config, checkout):
             content_ids=content_ids, content_type="product",
             contents=contents, num_items=num_items,
             pixel_id=config["pixel_id"], access_token=config["access_token"],
+            default_country=config["default_country"],
             log={"shop": shop, "source": "webhook"})
         delivered = 200 <= response.status_code < 300
     except Exception as e:
@@ -920,6 +928,7 @@ def init_meta_context_db():
     try:
         conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
         with conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(724504)")  # both workers start at once
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS meta_context (
                     id BIGSERIAL PRIMARY KEY,
@@ -931,6 +940,12 @@ def init_meta_context_db():
                     ON meta_context (checkout_token, received_at DESC);
                 CREATE INDEX IF NOT EXISTS meta_context_order
                     ON meta_context (order_id, received_at DESC);
+                -- Which store's checkout pixel sent it and which version, so
+                -- the hub's Setup tab can tick. Lookups stay by checkout token.
+                ALTER TABLE meta_context ADD COLUMN IF NOT EXISTS shop TEXT;
+                ALTER TABLE meta_context ADD COLUMN IF NOT EXISTS client_version INT;
+                CREATE INDEX IF NOT EXISTS meta_context_shop
+                    ON meta_context (shop, received_at DESC);
             """)
         conn.close()
     except Exception as e:
@@ -963,15 +978,22 @@ def meta_context_received():
         return jsonify(error="missing_checkout_token"), 400
     ua = body.get("user_agent")
     clean["user_agent"] = ua[:512] if isinstance(ua, str) else None
+    # The store is only recorded when it is in the hub (this endpoint is
+    # public); older pixels send none. It never affects which checkout the
+    # row belongs to.
+    shop = shop_key(body.get("shop"))
+    shop = shop if shop and store_config(shop) else None
+    version = body.get("v")
+    version = version if isinstance(version, int) and not isinstance(version, bool) and 0 < version < 1000 else None
 
     try:
         conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
         with conn, conn.cursor() as cur:
             cur.execute(
-                """INSERT INTO meta_context (checkout_token, order_id, vid, fbp, fbc, user_agent)
-                   VALUES (%s,%s,%s,%s,%s,%s)""",
+                """INSERT INTO meta_context (checkout_token, order_id, vid, fbp, fbc, user_agent, shop, client_version)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (clean.get("checkout_token"), clean.get("order_id"), clean.get("vid"),
-                 clean.get("fbp"), clean.get("fbc"), clean.get("user_agent")))
+                 clean.get("fbp"), clean.get("fbc"), clean.get("user_agent"), shop, version))
         conn.close()
     except Exception as e:
         logger.error(f"meta_context write failed: {type(e).__name__}")
@@ -1171,7 +1193,8 @@ def track_event():
         email=body.get("email"), phone=body.get("phone"),
         first_name=extras.get("first_name"), last_name=extras.get("last_name"),
         city=extras.get("city"), postcode=extras.get("postcode"),
-        region=extras.get("region"), country=extras.get("country"))
+        region=extras.get("region"), country=extras.get("country"),
+        default_country=config.get("default_country") or "GB")
     identified = "em" in own or "ph" in own
     write = identified or event_name in ("AddToCart", "InitiateCheckout")
     known = identity_record(
@@ -1228,6 +1251,7 @@ def track_event():
         user_agent=user_agent,
         external_id=vid,
         matched=known.get("match"),
+        default_country=config.get("default_country") or "GB",
         **{k: v for k, v in config.items() if k in ("pixel_id", "access_token")},
         **extras,
         log={"shop": shop, "source": "woo-relay" if woo_options else "browser",

@@ -12,6 +12,7 @@ first store (Comfi UK, set up before the hub) keeps working untouched.
 """
 import base64
 import hashlib
+import json
 import logging
 import os
 import queue
@@ -117,6 +118,21 @@ ALTER TABLE stores ADD COLUMN IF NOT EXISTS tracking_host TEXT;
 CREATE TABLE IF NOT EXISTS hub_migrations (
     name TEXT PRIMARY KEY,
     done_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Hub-wide settings edited in the hub (alert channel), encrypted like store credentials.
+CREATE TABLE IF NOT EXISTS hub_settings (
+    name TEXT PRIMARY KEY,
+    value_enc TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Each store's status at the last alert check, so alerts fire on changes only.
+CREATE TABLE IF NOT EXISTS store_alert_state (
+    store_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    reason TEXT,
+    problem_alerted BOOLEAN NOT NULL DEFAULT false,
+    last_alert_at TIMESTAMPTZ,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
 
@@ -292,6 +308,27 @@ def save_store(values, store_id=None):
             cur.execute(f"UPDATE stores SET {sets}, updated_at = now() WHERE id = %s",
                         [*fields.values(), store_id])
     forget_cached()
+
+
+def get_setting(name):
+    """A hub setting saved with save_setting (a dict), or {} when unset or unreadable."""
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT value_enc FROM hub_settings WHERE name = %s", (name,))
+        row = cur.fetchone()
+    text = decrypt(row[0]) if row else None
+    try:
+        value = json.loads(text) if text else {}
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def save_setting(name, value):
+    enc = encrypt(json.dumps(value))
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""INSERT INTO hub_settings (name, value_enc) VALUES (%s, %s)
+                       ON CONFLICT (name) DO UPDATE SET value_enc = EXCLUDED.value_enc, updated_at = now()""",
+                    (name, enc))
 
 
 def record_pixel_check(store_id, name, error):
