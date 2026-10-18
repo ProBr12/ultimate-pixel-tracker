@@ -304,6 +304,16 @@ def test_cooldown_stops_flapping(checker):
     assert checker(minutes=6 * 60, **{"comfi-uk": problem()})[0] == [("comfi-uk", "problem")]
 
 
+def test_red_kept_quiet_by_cooldown_is_announced_when_it_ends(checker):
+    assert checker(**{"comfi-uk": problem()})[0] == [("comfi-uk", "problem")]
+    assert checker(**{"comfi-uk": ok()})[0] == [("comfi-uk", "recovered")]
+    assert checker(**{"comfi-uk": problem()})[0] == []  # red again inside the cooldown
+    assert checker(minutes=2 * 60, **{"comfi-uk": problem()})[0] == []  # still inside it
+    assert checker(minutes=4 * 60, **{"comfi-uk": problem()})[0] == [("comfi-uk", "problem")]  # still red after it
+    assert checker(**{"comfi-uk": problem()})[0] == []  # announced once
+    assert checker(**{"comfi-uk": ok()})[0] == [("comfi-uk", "recovered")]
+
+
 def test_red_then_setup_then_red_still_recovers(checker):
     assert checker(**{"comfi-uk": problem()})[0] == [("comfi-uk", "problem")]
     assert checker(**{"comfi-uk": ("setup", "Switched off")})[0] == []

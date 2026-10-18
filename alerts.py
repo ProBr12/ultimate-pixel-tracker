@@ -120,9 +120,12 @@ def check_once(store_facts, store_status, now=None):
             state, reason = store_status(store, facts)
             previous, alerted, last_alert = known.get(store["id"], (None, False, None))
             last_alert_at = last_alert
-            if state == "problem" and previous != "problem":
+            # "Not yet announced" rather than "just turned red": a store that
+            # flaps inside the cooldown and then stays red is still announced
+            # once the cooldown ends.
+            if state == "problem" and not alerted:
                 if last_alert and now - last_alert < COOLDOWN:
-                    pass  # flapping: stay quiet; "recovered" follows only an announced problem
+                    pass  # flapping: stay quiet for now; "recovered" follows only an announced problem
                 else:
                     ok, error = telegram_send(config, problem_text(store, reason))
                     if not ok:
