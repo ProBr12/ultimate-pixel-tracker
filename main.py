@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
+import stores
+
 # Setup logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -55,6 +57,8 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
             CREATE INDEX IF NOT EXISTS idx_events_vid ON events (vid);
+            -- Which store each event belongs to (added with the hub; instant).
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS shop TEXT;
         """)
         conn.commit()
         cur.close()
@@ -64,7 +68,7 @@ def init_db():
         logger.error(f"DB init failed: {e}")
 
 
-def save_event_db(event_name, vid=None, url=None, referrer=None, value=None, order_id=None):
+def save_event_db(event_name, vid=None, url=None, referrer=None, value=None, order_id=None, shop=None):
     """Save every event to our own database. Never allowed to break tracking:
     if the DB is down, we log the error and Meta still gets the event."""
     if not DATABASE_URL:
@@ -75,14 +79,14 @@ def save_event_db(event_name, vid=None, url=None, referrer=None, value=None, ord
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         cur.execute(
-            """INSERT INTO events (event_name, vid, url, path, referrer, ad_id, adset_id, campaign_id, utm_source, value, order_id)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            """INSERT INTO events (event_name, vid, url, path, referrer, ad_id, adset_id, campaign_id, utm_source, value, order_id, shop)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (event_name, vid, url, parsed.path or None, referrer,
              q.get("ad_id", [None])[0],
              q.get("utm_term", [None])[0],
              q.get("campaign_id", [None])[0],
              q.get("utm_source", [None])[0],
-             value, order_id))
+             value, order_id, shop))
         conn.commit()
         cur.close()
         conn.close()
@@ -91,6 +95,47 @@ def save_event_db(event_name, vid=None, url=None, referrer=None, value=None, ord
 
 
 init_db()
+stores.init_store_db()
+
+
+def backfill_event_shops():
+    """Label events stored before the hub with their store (by the site
+    address in the URL; path-only Purchases came from the first store's order
+    webhook). Runs once, in id ranges, in the background."""
+    try:
+        with stores.db() as conn, conn.cursor() as cur:
+            # Built here, not at startup, so a large table never delays boot.
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_events_shop_ts ON events (shop, ts)")
+        with stores.db() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_xact_lock(724503)")
+            if not cur.fetchone()[0]:
+                return  # the other worker is on it
+            cur.execute("SELECT 1 FROM hub_migrations WHERE name = 'events_shop_backfill'")
+            if cur.fetchone():
+                return
+            cur.execute("SELECT shop_domain, site_url FROM stores WHERE shop_domain IS NOT NULL")
+            rules, params = [], []
+            for shop, site in cur.fetchall():
+                host = urlparse(site or "").hostname
+                if host:
+                    rules.append("WHEN url LIKE %s OR url LIKE %s OR url = %s THEN %s")
+                    params += [f"https://{host}/%", f"https://www.{host}/%", f"https://{host}", shop]
+            rules.append("WHEN event_name = 'Purchase' AND (url IS NULL OR url LIKE '/%%') THEN %s")
+            params.append(stores.FIRST_STORE["shop_domain"])
+            cur.execute("SELECT coalesce(min(id), 0), coalesce(max(id), 0) FROM events")
+            low, high = cur.fetchone()
+        step = 20000
+        for start in range(low - 1, high + 1, step):
+            with stores.db() as conn, conn.cursor() as cur:
+                cur.execute(
+                    f"UPDATE events SET shop = CASE {' '.join(rules)} END "
+                    f"WHERE id > %s AND id <= %s AND shop IS NULL AND (CASE {' '.join(rules)} END) IS NOT NULL",
+                    params + [start, start + step] + params)
+        with stores.db() as conn, conn.cursor() as cur:
+            cur.execute("INSERT INTO hub_migrations (name) VALUES ('events_shop_backfill') ON CONFLICT DO NOTHING")
+        logger.info("Backfilled the store on pre-hub events")
+    except Exception as e:
+        logger.error(f"event backfill failed: {type(e).__name__}: {e}")
 
 
 
@@ -216,7 +261,8 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     client_ip=None, user_agent=None,
                     external_id=None, content_ids=None, content_type=None,
                     contents=None, num_items=None, order_id=None,
-                    pixel_id=None, access_token=None, matched=None):
+                    pixel_id=None, access_token=None, matched=None,
+                    test_event_code=None, log=None):
 
     PIXEL_ID = pixel_id if pixel_id is not None else os.environ.get("PIXEL_ID")
     ACCESS_TOKEN = access_token if access_token is not None else os.environ.get("ACCESS_TOKEN")
@@ -286,27 +332,42 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
         f"Sending CAPI event: {event_name} | event_id: {event_id} | url: {source_url} | "
         f"keys: {','.join(sorted(user_data.keys()))}")
 
-    response = requests.post(
-        f"https://graph.facebook.com/v19.0/{PIXEL_ID}/events",
-        json=payload,
-        timeout=10
-    )
+    if test_event_code:
+        payload["test_event_code"] = test_event_code
+
+    try:
+        response = requests.post(
+            f"https://graph.facebook.com/v19.0/{PIXEL_ID}/events",
+            json=payload,
+            timeout=10
+        )
+    except requests.RequestException as e:
+        if log:
+            stores.log_delivery(log.get("shop"), event_name, log.get("source"), user_data.keys(), 0,
+                                f"{type(e).__name__}", log.get("version"), log.get("restored"))
+        raise
 
     logger.info(f"Meta CAPI response: {response.status_code} {response.text}")
+    if log:
+        ok = 200 <= response.status_code < 300
+        stores.log_delivery(log.get("shop"), event_name, log.get("source"), user_data.keys(),
+                            response.status_code, None if ok else response.text,
+                            log.get("version"), log.get("restored"))
     return response
 
 
-def verify_shopify_webhook(raw_body, hmac_header):
-    """Check that this webhook genuinely came from Shopify.
-    Shopify signs every webhook with a secret only you and Shopify know.
-    If SHOPIFY_WEBHOOK_SECRET is not set yet, we allow the request through
-    (so nothing breaks before you configure it) but log a loud warning."""
-    secret = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
-    if not secret:
-        logger.warning(
-            "SHOPIFY_WEBHOOK_SECRET not set - webhook accepted WITHOUT verification. Set it in Railway ASAP.")
-        return True
-    if not hmac_header:
+def verify_shopify_webhook(raw_body, hmac_header, secret=None):
+    """Check that this webhook genuinely came from Shopify: each store signs
+    its webhooks with its own key (Settings > Notifications > Webhooks).
+    Without a store's key (secret=None, used only by the Google route) the
+    SHOPIFY_WEBHOOK_SECRET Railway variable is used as before."""
+    if secret is None:
+        secret = os.environ.get("SHOPIFY_WEBHOOK_SECRET", "")
+        if not secret:
+            logger.warning(
+                "SHOPIFY_WEBHOOK_SECRET not set - webhook accepted WITHOUT verification. Set it in Railway ASAP.")
+            return True
+    if not secret or not hmac_header:
         return False
     digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
     computed = base64.b64encode(digest).decode()
@@ -314,27 +375,31 @@ def verify_shopify_webhook(raw_body, hmac_header):
 
 
 # ============ STORES ============
-# Everything that differs between stores is resolved here, keyed by the
-# store's permanent *.myshopify.com domain (Shopify sends it on every webhook
-# and the theme sends it on every event). Today every Shopify store uses the
-# Railway variables; the multi-store hub replaces store_config's body with a
-# database lookup and nothing else has to change.
+# Every store-specific value (pixel, access token, webhook key, country,
+# currency) comes from the hub's store registry (stores.py), keyed by the
+# store's permanent *.myshopify.com domain. Shopify sends it on every webhook
+# and the theme snippet sends it on every event. A store that is not in the
+# registry, or is switched off, sends nothing to Meta.
 
-SHOP_DOMAIN_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,60}\.myshopify\.com")
-
-
-def shop_key(value):
-    value = _text(value).lower()
-    return value if SHOP_DOMAIN_RE.fullmatch(value) else None
+shop_key = stores.shop_key
+store_config = stores.store_config
 
 
-def store_config(shop):
-    return {
-        "shop": shop,
-        "pixel_id": os.environ.get("PIXEL_ID"),
-        "access_token": os.environ.get("ACCESS_TOKEN"),
-        "default_country": os.environ.get("DEFAULT_COUNTRY", "GB"),
-    }
+def verified_store(raw_body, topic=None):
+    """(shop, store) for a webhook genuinely signed by a store in the
+    registry, otherwise (shop, None)."""
+    shop = shop_key(request.headers.get("X-Shopify-Shop-Domain"))
+    store = store_config(shop)
+    if not store or not store.get("webhook_secret"):
+        logger.warning(f"Webhook from a store not set up in the hub: {shop or '?'}")
+        return shop, None
+    if not verify_shopify_webhook(raw_body, request.headers.get("X-Shopify-Hmac-Sha256", ""),
+                                  store["webhook_secret"]):
+        logger.warning(
+            f"Webhook REJECTED - invalid signature for {shop}. Source IP: {request.headers.get('X-Forwarded-For', request.remote_addr)}")
+        stores.note_webhook(shop, topic or request.headers.get("X-Shopify-Topic"), "bad_signature")
+        return shop, None
+    return shop, store
 
 
 def site_origin(url):
@@ -564,6 +629,7 @@ def identity_cleanup():
                     DELETE FROM meta_context WHERE received_at < now() - interval '30 days';
                 """)
             conn.close()
+            stores.cleanup_logs()
         except Exception as e:
             logger.error(f"identity cleanup failed: {type(e).__name__}")
         time.sleep(6 * 3600)
@@ -573,18 +639,20 @@ def identity_cleanup():
 @app.route('/webhook/order-created', methods=['POST'])
 def order_created():
     raw_body = request.get_data()
-    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
-    if not verify_shopify_webhook(raw_body, hmac_header):
-        logger.warning(
-            f"Webhook REJECTED - invalid signature. Source IP: {request.headers.get('X-Forwarded-For', request.remote_addr)}")
+    shop, config = verified_store(raw_body, "orders/create")
+    if not config:
         return jsonify({'error': 'unauthorized'}), 401
 
     order = request.get_json(force=True, silent=True)
     if not isinstance(order, dict):
+        stores.note_webhook(shop, "orders/create", "invalid_body")
         return jsonify({'ok': True, 'ignored': 'invalid_body'}), 200
-    logger.info(f"Webhook received for order: {order.get('id')}")
-    shop = shop_key(request.headers.get("X-Shopify-Shop-Domain"))
-    config = store_config(shop)
+    logger.info(f"Webhook received for order: {order.get('id')} | shop: {shop}")
+    if order.get("test") is True:
+        # Shopify's "Send test" and test-gateway orders: never fake revenue in Meta.
+        stores.note_webhook(shop, "orders/create", "test_order_ignored")
+        logger.info(f"Test order {order.get('id')} not sent to Meta")
+        return jsonify({'ok': True, 'ignored': 'test_order'}), 200
 
     attrs = note_attributes(order)
     fbc = attrs.get("_fbc", "")
@@ -642,7 +710,8 @@ def order_created():
         vid=vid,
         url=order.get("landing_site"),
         value=float(total_price),
-        order_id=order_id)
+        order_id=order_id,
+        shop=shop)
 
     send_capi_event(
         event_name="Purchase",
@@ -661,7 +730,7 @@ def order_created():
         value=float(total_price),
         # total_price is always shop currency; pair it with the order's own currency field
         currency=order.get("currency", "GBP"),
-        source_url=site_origin(order.get("order_status_url")) or "https://comfishop.com",
+        source_url=site_origin(order.get("order_status_url")) or config.get("site_url"),
         client_ip=browser_ip,
         user_agent=browser_ua,
         # Both IDs: the browser sends the visitor ID, Meta can also join on the
@@ -673,8 +742,10 @@ def order_created():
         num_items=num_items,
         order_id=order_id,
         pixel_id=config["pixel_id"],
-        access_token=config["access_token"]
+        access_token=config["access_token"],
+        log={"shop": shop, "source": "webhook"}
     )
+    stores.note_webhook(shop, "orders/create", "purchase_sent")
 
     return jsonify({'ok': True}), 200
 
@@ -719,29 +790,29 @@ CHECKOUT_EVENT = "AddPaymentInfo"
 @app.route('/webhook/checkout', methods=['POST'])
 def checkout_webhook():
     raw_body = request.get_data()
-    if not verify_shopify_webhook(raw_body, request.headers.get("X-Shopify-Hmac-Sha256", "")):
-        logger.warning(
-            f"Checkout webhook REJECTED - invalid signature. Source IP: {request.headers.get('X-Forwarded-For', request.remote_addr)}")
+    topic = request.headers.get("X-Shopify-Topic") or "checkouts/update"
+    shop, config = verified_store(raw_body, topic)
+    if not config:
         return jsonify({'error': 'unauthorized'}), 401
     try:
         checkout = json.loads(raw_body)
     except (ValueError, TypeError):
-        return jsonify({'ok': True, 'ignored': 'invalid_json'}), 200
+        checkout = None
     if not isinstance(checkout, dict):
+        stores.note_webhook(shop, topic, "invalid_body")
         return jsonify({'ok': True, 'ignored': 'invalid_body'}), 200
-    shop = shop_key(request.headers.get("X-Shopify-Shop-Domain"))
     try:
-        result = handle_checkout(shop, checkout)
+        result = handle_checkout(shop, config, checkout)
     except Exception as e:
         # Always 200: Shopify disables webhooks that keep failing, and a lost
         # checkout signal must never cost us the order webhooks.
         logger.error(f"Checkout webhook failed: {type(e).__name__}: {e}")
         result = "error"
+    stores.note_webhook(shop, topic, result)
     return jsonify({'ok': True, 'result': result}), 200
 
 
-def handle_checkout(shop, checkout):
-    config = store_config(shop)
+def handle_checkout(shop, config, checkout):
     token = checkout.get("token")
     token = token if isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9_-]{8,128}", token) else ""
     attrs = note_attributes(checkout)
@@ -799,7 +870,7 @@ def handle_checkout(shop, checkout):
     # Checkout amounts are in the shopper's currency, not the shop's.
     currency = checkout.get("presentment_currency")
     if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
-        currency = checkout.get("currency") if isinstance(checkout.get("currency"), str) else "GBP"
+        currency = checkout.get("currency") if isinstance(checkout.get("currency"), str) else config["currency"]
 
     try:
         response = send_capi_event(
@@ -811,12 +882,13 @@ def handle_checkout(shop, checkout):
             city=buyer["city"], postcode=buyer["postcode"], region=buyer["region"],
             country=buyer["country"],
             value=value, currency=currency,
-            source_url=site_origin(checkout.get("abandoned_checkout_url")) or "https://comfishop.com",
+            source_url=site_origin(checkout.get("abandoned_checkout_url")) or config.get("site_url"),
             client_ip=known.get("client_ip"), user_agent=user_agent,
             external_id=[vid, buyer["customer_id"]],
             content_ids=content_ids, content_type="product",
             contents=contents, num_items=num_items,
-            pixel_id=config["pixel_id"], access_token=config["access_token"])
+            pixel_id=config["pixel_id"], access_token=config["access_token"],
+            log={"shop": shop, "source": "webhook"})
         delivered = 200 <= response.status_code < 300
     except Exception as e:
         logger.error(f"{CHECKOUT_EVENT} send failed: {type(e).__name__}")
@@ -990,7 +1062,7 @@ def woo_order_created():
     if not 200 <= response.status_code < 300:
         return jsonify({'error': 'Meta delivery failed'}), 502
 
-    save_event_db("Purchase", vid=vid, url=source_url, value=value, order_id=order_id)
+    save_event_db("Purchase", vid=vid, url=source_url, value=value, order_id=order_id, shop="woo")
     return jsonify({'ok': True}), 200
 
 
@@ -1065,9 +1137,17 @@ def track_event():
             "content_ids", "content_type", "contents", "num_items")})
         extras = woo_options
         shop = "woo"
+        config = {}
     else:
         extras = browser_extras(body)
         shop = shop_key(body.get("shop"))
+        config = store_config(shop)
+        if not config:
+            # Not a store in the hub (or switched off): its events must never
+            # land in another store's pixel.
+            logger.info(f"Skipped event from a store not set up in the hub: {body.get('event_name')} | "
+                        f"shop: {shop or '-'} | url: {str(body.get('source_url'))[:80]}")
+            return jsonify({'ok': True, 'skipped': 'unknown_store'}), 200
 
     vid = body.get("vid")
 
@@ -1110,7 +1190,9 @@ def track_event():
         if value is not None and not 0 <= value < 10_000_000:
             value = None
         if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
-            currency = "GBP"
+            currency = config["currency"]
+    version = body.get("v")
+    version = version if isinstance(version, int) and not isinstance(version, bool) and 0 < version < 1000 else None
     # Fall back to the click and browser IDs stored for this visitor when the
     # browser lost its own (Safari's 7-day wipe, ad blockers).
     fbc = body.get("fbc") if valid_fbc(body.get("fbc")) else (
@@ -1122,9 +1204,9 @@ def track_event():
         vid=vid,
         url=body.get("source_url"),
         referrer=body.get("referrer"),
-        value=value)
+        value=value,
+        shop=shop)
 
-    config = store_config(shop) if not woo_options else {}
     response = send_capi_event(
         event_name=event_name,
         event_id=body.get("event_id", f"evt_{int(time.time())}"),
@@ -1141,7 +1223,9 @@ def track_event():
         external_id=vid,
         matched=known.get("match"),
         **{k: v for k, v in config.items() if k in ("pixel_id", "access_token")},
-        **extras
+        **extras,
+        log={"shop": shop, "source": "woo-relay" if woo_options else "browser",
+             "version": version, "restored": restored}
     )
 
     if woo_options and not 200 <= response.status_code < 300:
@@ -1727,6 +1811,13 @@ if os.environ.get("GOOGLE_TRACKING_ENABLED") == "true" and DATABASE_URL:
 
 if DATABASE_URL:
     threading.Thread(target=identity_cleanup, name="identity-cleanup", daemon=True).start()
+    threading.Thread(target=backfill_event_shops, name="event-backfill", daemon=True).start()
+    stores.start_background()
+
+
+# ============ HUB (store setup, health, funnel) ============
+import hub  # noqa: E402  (needs the functions above)
+hub.register(app, send_capi_event=send_capi_event)
 
 
 if __name__ == "__main__":

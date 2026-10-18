@@ -4,3 +4,4 @@ requests
 psycopg2-binary
 gunicorn
 google-auth>=2.40,<3
+cryptography>=44,<51
