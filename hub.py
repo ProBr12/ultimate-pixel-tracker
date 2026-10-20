@@ -457,7 +457,11 @@ def readable_meta_error(text):
 
 
 def check_pixel(pixel_id, access_token):
-    """(pixel name, None) when Meta accepts this token for this pixel, else (None, reason)."""
+    """(pixel name, None) when Meta lets this token read the pixel; (None, None)
+    when Meta only refuses to show the token the pixel's details, which is how
+    tokens made in Events Manager behave even though they send events fine (a
+    test event, or the store's first accepted events, confirm those); otherwise
+    (None, reason)."""
     try:
         r = requests.get(f"https://graph.facebook.com/v19.0/{pixel_id}",
                          params={"fields": "name", "access_token": access_token}, timeout=10)
@@ -466,7 +470,10 @@ def check_pixel(pixel_id, access_token):
         return None, "Could not reach Meta to check. Try again in a minute."
     if r.status_code == 200 and body.get("name"):
         return body["name"], None
-    message = (body.get("error") or {}).get("message") or f"Meta answered {r.status_code}"
+    error = body.get("error") or {}
+    message = error.get("message") or f"Meta answered {r.status_code}"
+    if re.search(r"missing permission", message, re.I) and not error.get("error_subcode"):
+        return None, None
     return None, message[:300]
 
 
@@ -724,7 +731,8 @@ def store_page(store_id):
             return setup_needed_page()
         store = stores.get_store(store_id)
         name, problem = check_pixel(store["pixel_id"], store["access_token"])
-        stores.record_pixel_check(store_id, name, problem)
+        # The pixel ID or token may have changed: an earlier test event no longer vouches for it.
+        stores.record_pixel_check(store_id, name, problem, reset_verified=True)
         return redirect(f"/hub/stores/{store_id}?tab=settings&saved=1")
     try:
         facts = store_facts(store["shop_domain"])
@@ -823,16 +831,28 @@ def setup_view(store, facts):
         return (f'<li class="{kind}"><div><h3>{title}</h3><p class="state {kind}">{state_text}</p>'
                 f"{body}</div></li>")
 
-    pixel_ok = bool(store["pixel_name"]) and not store["pixel_check_error"]
-    if pixel_ok:
+    pixel_error = store["pixel_check_error"]
+    verified = store.get("pixel_verified_at")
+    accepting = facts.get("accepted", 0) > 0
+    pixel_ok = not pixel_error and bool(store["pixel_name"] or verified or accepting)
+    if pixel_error:
+        pixel_state = f"Meta said: {esc(pixel_error)}"
+    elif store["pixel_name"]:
         pixel_state = f"Connected to “{esc(store['pixel_name'])}”, checked {ago(store['pixel_checked_at'])}."
-    elif store["pixel_check_error"]:
-        pixel_state = f"Meta said: {esc(store['pixel_check_error'])}"
+    elif verified:
+        pixel_state = f"Working: Meta accepted a test event sent with this token {ago(verified)}."
+    elif accepting:
+        pixel_state = "Working: Meta is accepting this store's events."
+    elif store["pixel_checked_at"]:
+        pixel_state = ("Token saved. Tokens made in Events Manager can send events but aren't allowed to read the "
+                       "pixel's details, so the hub confirms them by sending instead: add a test event code in "
+                       "Settings and press Send test event at the bottom of this page. This also turns green by "
+                       "itself once Meta accepts the store's first events.")
     else:
         pixel_state = "Not checked yet."
     pixel_step = step(pixel_ok, "Meta pixel and access token", pixel_state, f"""
 <form method="post" action="/hub/stores/{sid}/check-pixel">{csrf_field()}<button class="btn quiet small">Check again</button></form>""",
-                      waiting=not store["pixel_check_error"])
+                      waiting=not pixel_error)
 
     own = store.get("tracking_host")
     address_ok = address_reaches_hub(own) if own and own != host else True
@@ -1742,8 +1762,15 @@ def test_event(store_id):
             body = response.json()
         except ValueError:
             body = {}
+        refusal = (body.get("error") or {}).get("message") or str(response.status_code)
         msg = ("Meta received it. It shows in Test events within a few seconds." if ok else
-               f"Meta refused it: {((body.get('error') or {}).get('message') or response.status_code)}")
+               f"Meta refused it: {refusal}")
+        # Meta's answer to a real send is the proof that matters for the token.
+        if ok:
+            stores.mark_pixel_verified(store_id)
+        else:
+            stores.record_pixel_check(store_id, store["pixel_name"], f"Meta refused a test event: {refusal}"[:300],
+                                      reset_verified=True)
     except Exception as e:
         ok, msg = False, f"Could not reach Meta ({type(e).__name__}). Try again."
     from urllib.parse import quote

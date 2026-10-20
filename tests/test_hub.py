@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -31,6 +32,8 @@ class Wire:
         self.posts, self.gets = [], []
         self.telegram_ok = True
         self.updates = []
+        self.pixel_read_error = None  # Meta's error for reading the pixel's name, if any
+        self.send_error = None  # Meta's error for sending events, if any
 
     def response(self, status, body):
         r = MagicMock(status_code=status, text=json.dumps(body))
@@ -42,6 +45,8 @@ class Wire:
         if "api.telegram.org" in url:
             return (self.response(200, {"ok": True}) if self.telegram_ok
                     else self.response(400, {"ok": False, "description": "Bad Request: chat not found"}))
+        if self.send_error:
+            return self.response(400, {"error": self.send_error})
         return self.response(200, {"events_received": 1})
 
     def get(self, url, params=None, timeout=None, **kwargs):
@@ -50,6 +55,8 @@ class Wire:
             return self.response(200, {"ok": True, "result": self.updates})
         if url.endswith("/ping"):
             return self.response(200, {"ok": True, "service": "tracking-hub"})
+        if self.pixel_read_error:
+            return self.response(400, {"error": self.pixel_read_error})
         return self.response(200, {"name": "Test pixel"})
 
     def meta(self):
@@ -357,3 +364,80 @@ def test_storage_trouble_skips_store(wire, checker):
         raise RuntimeError("db down")
     assert alerts.check_once(broken, lambda s, f: problem()) == []
     assert wire.telegram() == []
+
+
+# ============ PIXEL CHECK: TOKENS THAT SEND BUT CANNOT READ ============
+
+READ_DENIED = {"message": "(#100) Missing Permission", "type": "OAuthException", "code": 100}
+BAD_TOKEN = {"message": "Invalid OAuth access token - Cannot parse access token", "type": "OAuthException",
+             "code": 190}
+
+
+def second_store_row():
+    return next(s for s in stores.list_stores() if s["shop_domain"] == SECOND)
+
+
+def save_second_settings(client, **changes):
+    data = {"csrf": "t", "name": "Second Store", "shop_domain": SECOND, "site_url": "https://second.example",
+            "pixel_id": "222333444555", "default_country": "US", "currency": "USD",
+            "test_event_code": "TEST39027", "enabled": "on", **changes}
+    return client.post(f"/hub/stores/{second_store_row()['id']}", data=data)
+
+
+@pytest.fixture
+def restore_second_store():
+    yield
+    stores.record_pixel_check(second_store_row()["id"], "Test pixel", None, reset_verified=True)
+
+
+def test_token_that_cannot_read_the_pixel_is_not_red(logged_in, wire, restore_second_store):
+    """Live, 20 Oct: a WiseHear token made in Events Manager sent a test event
+    that Meta processed, yet reading the pixel's name gave (#100) Missing Permission."""
+    wire.pixel_read_error = READ_DENIED
+    assert save_second_settings(logged_in).status_code == 302
+    store = second_store_row()
+    assert store["pixel_check_error"] is None and store["pixel_name"] is None
+    assert hub.store_status(store)[0] != "problem"
+    page = setup_page(logged_in, store["id"])
+    assert "Token saved." in page and "Meta said" not in page
+
+    r = logged_in.post(f"/hub/stores/{store['id']}/test-event", data={"csrf": "t"})
+    assert "test=ok" in r.headers["Location"]
+    store = second_store_row()
+    assert store["pixel_verified_at"] is not None
+    assert "Working: Meta accepted a test event" in setup_page(logged_in, store["id"])
+
+    # Saving the settings again (perhaps a new token) needs fresh proof.
+    save_second_settings(logged_in)
+    assert second_store_row()["pixel_verified_at"] is None
+
+
+def test_red_test_event_and_bad_token_stay_red(logged_in, wire, restore_second_store):
+    wire.pixel_read_error = BAD_TOKEN
+    save_second_settings(logged_in)
+    store = second_store_row()
+    assert store["pixel_check_error"].startswith("Invalid OAuth access token")
+    assert hub.store_status(store) == ("problem", "Meta rejected the pixel ID or access token")
+
+    wire.pixel_read_error = READ_DENIED
+    save_second_settings(logged_in)
+    wire.send_error = {"message": "(#100) Missing Permission", "code": 100}
+    r = logged_in.post(f"/hub/stores/{second_store_row()['id']}/test-event", data={"csrf": "t"})
+    assert "test=bad" in r.headers["Location"]
+    store = second_store_row()
+    assert store["pixel_check_error"] == "Meta refused a test event: (#100) Missing Permission"
+    assert hub.store_status(store)[0] == "problem"
+
+
+def test_unreadable_token_goes_green_once_events_are_accepted(logged_in, app_client, wire, restore_second_store):
+    wire.pixel_read_error = READ_DENIED
+    save_second_settings(logged_in)
+    assert track(app_client, SECOND).status_code == 200
+    time.sleep(2.5)  # the delivery log is written in batches
+    assert "Working: Meta is accepting this store's events." in setup_page(logged_in, second_store_row()["id"])
+
+
+def test_tracking_does_not_read_the_new_column(app_client, wire):
+    """The per-event lookup must keep working even if the new column were missing."""
+    assert "pixel_verified_at" not in stores.STORE_COLUMNS
+    assert "pixel_verified_at" in stores.HUB_COLUMNS

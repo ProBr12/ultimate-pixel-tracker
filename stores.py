@@ -115,6 +115,10 @@ CREATE INDEX IF NOT EXISTS meta_deliveries_shop_ts ON meta_deliveries (shop, ts 
 -- Where the store's browser sends its events, e.g. track.yourstore.com (a
 -- subdomain of the store's own site pointed at the hub). Empty: the hub's address.
 ALTER TABLE stores ADD COLUMN IF NOT EXISTS tracking_host TEXT;
+-- When Meta last accepted a test event sent with the store's token. Tokens made
+-- in Events Manager can send events but not read the pixel's name, so for
+-- those this, not the name lookup, is what confirms the token works.
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS pixel_verified_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS hub_migrations (
     name TEXT PRIMARY KEY,
     done_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -222,10 +226,13 @@ STORE_COLUMNS = ("id", "account_id", "platform", "name", "shop_domain", "site_ur
                  "access_token_enc", "webhook_secret_enc", "test_event_code", "default_country",
                  "currency", "enabled", "uses_env_credentials", "pixel_name", "pixel_checked_at",
                  "pixel_check_error", "created_at", "updated_at", "tracking_host")
+# The hub's pages also read when the token was last confirmed by a test event.
+# Kept out of store_config, the per-event lookup, so tracking never depends on it.
+HUB_COLUMNS = STORE_COLUMNS + ("pixel_verified_at",)
 
 
-def _row_to_store(row):
-    store = dict(zip(STORE_COLUMNS, row))
+def _row_to_store(row, columns=STORE_COLUMNS):
+    store = dict(zip(columns, row))
     env = store["uses_env_credentials"]
     store["access_token"] = decrypt(store["access_token_enc"]) or (
         os.environ.get("ACCESS_TOKEN") if env else None)
@@ -274,15 +281,15 @@ def forget_cached(shop=None):
 
 def list_stores():
     with db() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT {', '.join(STORE_COLUMNS)} FROM stores ORDER BY created_at")
-        return [_row_to_store(r) for r in cur.fetchall()]
+        cur.execute(f"SELECT {', '.join(HUB_COLUMNS)} FROM stores ORDER BY created_at")
+        return [_row_to_store(r, HUB_COLUMNS) for r in cur.fetchall()]
 
 
 def get_store(store_id):
     with db() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT {', '.join(STORE_COLUMNS)} FROM stores WHERE id = %s", (store_id,))
+        cur.execute(f"SELECT {', '.join(HUB_COLUMNS)} FROM stores WHERE id = %s", (store_id,))
         row = cur.fetchone()
-    return _row_to_store(row) if row else None
+    return _row_to_store(row, HUB_COLUMNS) if row else None
 
 
 def save_store(values, store_id=None):
@@ -331,10 +338,20 @@ def save_setting(name, value):
                     (name, enc))
 
 
-def record_pixel_check(store_id, name, error):
+def record_pixel_check(store_id, name, error, reset_verified=False):
+    """Store the result of the hub's pixel check. reset_verified forgets an
+    earlier accepted test event (the pixel ID or token may have changed)."""
     with db() as conn, conn.cursor() as cur:
-        cur.execute("""UPDATE stores SET pixel_name = %s, pixel_check_error = %s, pixel_checked_at = now()
-                       WHERE id = %s""", (name, error, store_id))
+        cur.execute("""UPDATE stores SET pixel_name = %s, pixel_check_error = %s, pixel_checked_at = now(),
+                              pixel_verified_at = CASE WHEN %s THEN NULL ELSE pixel_verified_at END
+                       WHERE id = %s""", (name, error, reset_verified, store_id))
+
+
+def mark_pixel_verified(store_id):
+    """Meta accepted a test event sent with this store's token: it works."""
+    with db() as conn, conn.cursor() as cur:
+        cur.execute("""UPDATE stores SET pixel_verified_at = now(), pixel_check_error = NULL
+                       WHERE id = %s""", (store_id,))
 
 
 # ============ LOGS FOR THE HEALTH PAGE ============
