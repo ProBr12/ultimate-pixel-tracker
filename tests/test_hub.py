@@ -441,3 +441,59 @@ def test_tracking_does_not_read_the_new_column(app_client, wire):
     """The per-event lookup must keep working even if the new column were missing."""
     assert "pixel_verified_at" not in stores.STORE_COLUMNS
     assert "pixel_verified_at" in stores.HUB_COLUMNS
+
+
+# ============ PURCHASE FALLS BACK TO THE VISITOR'S STORED IDS ============
+
+def click_id(days_ago, click="IwAR" + "q" * 30):
+    return f"fb.1.{int((time.time() - days_ago * 86400) * 1000)}.{click}"
+
+
+def purchase_user_data(wire, order_id):
+    sent = [p["body"]["data"][0] for p in wire.meta()
+            if p["body"]["data"][0]["event_id"] == f"purchase_{order_id}"]
+    assert len(sent) == 1
+    return sent[0]["user_data"]
+
+
+def test_purchase_uses_stored_ids_when_the_order_has_only_the_visitor(app_client, wire):
+    fbc, fbp = click_id(3), "fb.1.1760000000000.111222333"
+    assert track(app_client, SECOND, event_name="AddToCart", vid="v_stored00001",
+                 fbc=fbc, fbp=fbp).status_code == 200
+    body = {**order(7101), "note_attributes": [{"name": "_comfi_vid", "value": "v_stored00001"}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, body).status_code == 200
+    user = purchase_user_data(wire, 7101)
+    assert user["fbc"] == fbc and user["fbp"] == fbp
+
+
+def test_purchase_never_uses_a_stored_click_older_than_90_days(app_client, wire):
+    assert track(app_client, SECOND, event_name="AddToCart", vid="v_stored00002",
+                 fbc=click_id(91), fbp="fb.1.1760000000000.444555666").status_code == 200
+    body = {**order(7102), "note_attributes": [{"name": "_comfi_vid", "value": "v_stored00002"}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, body).status_code == 200
+    user = purchase_user_data(wire, 7102)
+    assert "fbc" not in user and user["fbp"] == "fb.1.1760000000000.444555666"
+
+
+def test_the_orders_own_click_beats_an_older_stored_one(app_client, wire):
+    assert track(app_client, SECOND, event_name="AddToCart", vid="v_stored00003",
+                 fbc=click_id(20, "IwARold" + "o" * 20)).status_code == 200
+    body = {**order(7103), "landing_site": "/products/x?fbclid=IwARnew" + "n" * 20,
+            "note_attributes": [{"name": "_comfi_vid", "value": "v_stored00003"}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, body).status_code == 200
+    assert purchase_user_data(wire, 7103)["fbc"].endswith(".IwARnew" + "n" * 20)
+
+
+def test_cart_ids_beat_stored_ones_and_junk_counts_as_missing(app_client, wire):
+    stored = click_id(10, "IwARstored" + "s" * 20)
+    assert track(app_client, SECOND, event_name="AddToCart", vid="v_stored00004", fbc=stored).status_code == 200
+    cart = click_id(1, "IwARcart" + "c" * 20)
+    body = {**order(7104), "note_attributes": [{"name": "_comfi_vid", "value": "v_stored00004"},
+                                               {"name": "_fbc", "value": cart}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, body).status_code == 200
+    assert purchase_user_data(wire, 7104)["fbc"] == cart
+    junk = {**order(7105), "note_attributes": [{"name": "_comfi_vid", "value": "v_stored00004"},
+                                               {"name": "_fbc", "value": "fb.1.1779838569048.fbclid"}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, junk).status_code == 200
+    # The cart's newer click was stored by the first order, so that is what fills the gap.
+    assert purchase_user_data(wire, 7105)["fbc"] == cart

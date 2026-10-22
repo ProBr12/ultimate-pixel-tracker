@@ -670,12 +670,21 @@ def order_created():
 
     # Express checkout / Buy it now skip the cart, so the cart attributes are
     # missing. Fill the gaps from what the checkout pixel sent (/meta/context).
+    # A malformed value counts as missing, as in the checkout webhook.
     context = {}
-    if not (vid and fbp and fbc):
+    if not (valid_vid(vid) and valid_fbp(fbp) and valid_fbc(fbc)):
         context = meta_context_lookup(order.get("checkout_token"))
-        vid = vid or context.get("vid") or ""
-        fbp = fbp or context.get("fbp") or ""
-        fbc = fbc or context.get("fbc") or ""
+        vid = vid if valid_vid(vid) else (context.get("vid") or "")
+        fbp = fbp if valid_fbp(fbp) else (context.get("fbp") or "")
+        fbc = fbc if valid_fbc(fbc) else (context.get("fbc") or "")
+
+    # Remember this buyer against their visitor ID, so their later visits
+    # carry the email and phone they bought with. The stored row also holds
+    # the click and browser IDs from this visitor's earlier events, and their
+    # user agent and IP for when the order has none.
+    buyer = buyer_details(order)
+    known = identity_record(shop, vid, match=buyer_match(buyer, config["default_country"]),
+                            fbc=fbc, fbp=fbp)
 
     if not valid_fbc(fbc) and not valid_fbclid(fbclid):
         landing_site = order.get("landing_site", "") or ""
@@ -690,19 +699,25 @@ def order_created():
             fbclid = ls_fbclid
             logger.info(f"Recovered fbclid from landing_site: {fbclid}")
 
+    # Last resort, the IDs this visitor's own browser sent us earlier (their
+    # AddToCart, InitiateCheckout, a past order), as /track and the checkout
+    # webhook already do: the cart and the checkout pixel can both miss them.
+    # This order's own click (fbclid above) wins over an older stored one.
+    from_identity = []
+    if not valid_fbc(fbc) and not valid_fbclid(fbclid) and fbc_recent(known.get("fbc")):
+        fbc = known["fbc"]
+        from_identity.append("fbc")
+    if not valid_fbp(fbp) and valid_fbp(known.get("fbp")):
+        fbp = known["fbp"]
+        from_identity.append("fbp")
+
     logger.info(
         f"Identifiers for order {order_id}: vid={bool(vid)} fbc={bool(fbc)} fbp={bool(fbp)} "
-        f"fbclid={bool(fbclid)} from_context={bool(context)} utm_source={utm_source}")
+        f"fbclid={bool(fbclid)} from_context={bool(context)} "
+        f"from_identity={','.join(from_identity) or '-'} utm_source={utm_source}")
 
     total_price = order.get("total_price", "0")
-    buyer = buyer_details(order)
     content_ids, contents, num_items = line_item_contents(order)
-
-    # Remember this buyer against their visitor ID, so their later visits
-    # carry the email and phone they bought with. The stored row also gives
-    # the browser's user agent and IP when the order has none.
-    known = identity_record(shop, vid, match=buyer_match(buyer, config["default_country"]),
-                            fbc=fbc, fbp=fbp)
 
     # Extract IP and User Agent from Shopify's client_details
     client_details = order.get("client_details") or {}
