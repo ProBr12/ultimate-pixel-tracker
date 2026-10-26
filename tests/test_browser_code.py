@@ -215,13 +215,13 @@ def theme_values(**customer):
     return values
 
 
-def run_theme(tmp_path, store, logged_in, **customer):
+def run_theme(tmp_path, store, logged_in, scenario=None, **customer):
     values = theme_values(**customer)
     if "localization" in customer:
         values["localization.country.iso_code"] = customer["localization"]
     scripts = liquid(hub.render_snippet(store, "https://track.comfishop.com/track"), values, logged_in)
     assert len(scripts) == 3
-    return node("theme", json.dumps(scripts), {"url": "https://comfishop.com/"}, tmp_path)
+    return node("theme", json.dumps(scripts), {"url": "https://comfishop.com/", **(scenario or {})}, tmp_path)
 
 
 def test_theme_gb_customer(tmp_path):
@@ -256,3 +256,64 @@ def test_theme_guest(tmp_path):
     init = next(c for c in got["fbq"] if c[0] == "init")
     assert init[2] == {"country": "gb"}
     assert [c[1] for c in got["fbq"] if c[0] == "track"] == ["PageView"]
+
+
+# ============ THEME v8: HANDOFF, FIRST-PAGE fbp, EXPRESS WALLETS ============
+
+FBP_RE = re.compile(r"^fb\.1\.\d{13}\.\d{10}$")
+CLICK = "IwARhandoff" + "h" * 20
+
+
+def recent_ms(minutes_ago=5):
+    import time
+    return int((time.time() - minutes_ago * 60) * 1000)
+
+
+def test_first_page_has_an_fbp_straight_away(tmp_path):
+    got = run_theme(tmp_path, COMFI, False)
+    assert FBP_RE.match(got["cookies"]["_fbp"])
+    assert got["track"][0]["fbp"] == got["cookies"]["_fbp"]
+
+
+def test_existing_fbp_is_kept(tmp_path):
+    mine = "fb.1.1790000000000.123456789"
+    got = run_theme(tmp_path, COMFI, False, {"cookies": {"_fbp": mine},
+                    "url": "https://comfishop.com/?fbp=fb.1.1793042396399.476937934158071451"})
+    assert got["cookies"]["_fbp"] == mine and got["track"][0]["fbp"] == mine
+
+
+def test_advertorial_hands_over_fbp_and_click_time(tmp_path):
+    fbc = f"fb.1.{recent_ms()}.{CLICK}"
+    url = f"https://comfishop.com/products/x?fbclid={CLICK}&fbp=fb.1.1793042396399.476937934158071451&fbc={fbc}"
+    got = run_theme(tmp_path, COMFI, False, {"url": url})
+    assert got["cookies"]["_fbp"] == "fb.1.1793042396399.476937934158071451"
+    assert got["cookies"]["_fbc"] == fbc
+    page_view = got["track"][0]
+    assert page_view["fbp"] == "fb.1.1793042396399.476937934158071451" and page_view["fbc"] == fbc
+    assert page_view["restored"] == "fbp_url,fbc_url"
+
+
+def test_handed_over_click_must_match_the_url(tmp_path):
+    other = f"fb.1.{recent_ms()}.IwARsomeoneelse" + "x" * 20
+    got = run_theme(tmp_path, COMFI, False, {"url": f"https://comfishop.com/?fbclid={CLICK}&fbc={other}"})
+    assert got["track"][0]["fbc"].endswith("." + CLICK) and got["track"][0]["fbc"] != other
+
+
+def test_junk_handover_is_ignored(tmp_path):
+    got = run_theme(tmp_path, COMFI, False, {"url": f"https://comfishop.com/?fbclid={CLICK}&fbp=evil&fbc=fb.1.2.{CLICK}"})
+    assert FBP_RE.match(got["cookies"]["_fbp"])
+    assert got["track"][0]["fbc"].endswith("." + CLICK)
+    assert "restored" not in got["track"][0]
+
+
+def test_shop_pay_tap_reports_initiate_checkout_once(tmp_path):
+    got = run_theme(tmp_path, COMFI, False, {"taps": ["shopify-accelerated-checkout", "shop-pay-wallet-button"]})
+    checkouts = [t for t in got["track"] if t["event_name"] == "InitiateCheckout"]
+    assert len(checkouts) == 1
+    assert checkouts[0]["vid"].startswith("v_") and checkouts[0]["fbp"] == got["cookies"]["_fbp"]
+    assert [c[1] for c in got["fbq"] if c[0] == "track"].count("InitiateCheckout") == 1
+
+
+def test_other_taps_send_nothing(tmp_path):
+    got = run_theme(tmp_path, COMFI, False, {"taps": ["button.add-to-cart"]})
+    assert [t["event_name"] for t in got["track"]] == ["PageView"]

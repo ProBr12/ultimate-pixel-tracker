@@ -24,7 +24,7 @@ from phonenumbers import PhoneMetadata
 import alerts
 import stores
 
-SNIPPET_VERSION = 7
+SNIPPET_VERSION = 8
 CHECKOUT_PIXEL_VERSION = 3
 bp = Blueprint("hub", __name__, url_prefix="/hub")
 _send_capi_event = None
@@ -1009,18 +1009,45 @@ SNIPPET_TEMPLATE = r'''{%- comment -%}
       restored.push("vid");
     }
 
+    // An advertorial on another domain using the same pixel hands its
+    // browser ID (fbp) and click (fbc, with the true click time) over in
+    // the link. Only used when this store has none of its own.
+    var params = new URLSearchParams(location.search);
+    var urlClick = params.get("fbclid");
+    var urlFbp = params.get("fbp"), urlFbc = params.get("fbc");
+
     if (!valid(FBP, getCookie("_fbp"))) {
       var fbp = valid(FBP, ls.getItem("comfi_fbp")) ? ls.getItem("comfi_fbp")
         : (valid(FBP, saved.fbp) ? saved.fbp : "");
       if (fbp) {
-        setCookie("_fbp", fbp, 90);
-        ls.setItem("comfi_fbp", fbp);
         restored.push("fbp");
+      } else if (valid(FBP, urlFbp)) {
+        fbp = urlFbp;
+        restored.push("fbp_url");
+      } else {
+        // None anywhere: make one now, in Meta's documented format, rather
+        // than seconds later. Meta's pixel adopts an existing _fbp, so every
+        // event from this first page carries the same browser ID.
+        fbp = "fb.1." + Date.now() + "." + Math.floor(1e9 + Math.random() * 9e9);
+      }
+      setCookie("_fbp", fbp, 90);
+      ls.setItem("comfi_fbp", fbp);
+    }
+
+    // The handed-over click must be the same click as in this URL.
+    if (urlClick && valid(FBC, urlFbc) && recentClick(urlFbc)
+        && urlFbc.split(".").slice(3).join(".") === urlClick) {
+      var currentFbc = getCookie("_fbc");
+      if (!currentFbc || currentFbc.split(".").slice(3).join(".") !== urlClick) {
+        setCookie("_fbc", urlFbc, 90);
+        ls.setItem("comfi_fbc", urlFbc);
+        ls.setItem("comfi_fbclid", urlClick);
+        restored.push("fbc_url");
       }
     }
 
     // A new ad click in the URL always wins; Meta's pixel records it itself.
-    if (!new URLSearchParams(location.search).get("fbclid")) {
+    if (!urlClick) {
       var cookieFbc = getCookie("_fbc");
       if (cookieFbc && !valid(FBC, cookieFbc)) {
         // Junk like "fb.1.1779838569048.fbclid" from an old script: remove it.
@@ -1402,6 +1429,33 @@ src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1"
       }
       return result;
     };
+
+    // Express wallets (Shop Pay, Apple Pay, Google Pay, Buy it now) open a
+    // checkout that skips the cart and runs no pixel, so the order arrives
+    // with no visitor ID. Report the tap as InitiateCheckout: it is one, and
+    // it gives the hub this visitor's IDs, IP and user agent seconds before
+    // the order, which is how the order is matched back to them.
+    var EXPRESS = ".shopify-payment-button, shopify-accelerated-checkout, shopify-accelerated-checkout-cart, "
+      + ".additional-checkout-buttons, shop-pay-wallet-button, [data-shopify='payment-button']";
+    var CART_EXPRESS = "shopify-accelerated-checkout-cart, .additional-checkout-buttons, form[action*='/cart']";
+    var expressSentAt = 0;
+    function onExpressTap(e) {
+      var el = e.target && e.target.closest ? e.target.closest(EXPRESS) : null;
+      if (!el || Date.now() - expressSentAt < 30000) return;
+      expressSentAt = Date.now();
+      try {
+        sendCapiEvent("InitiateCheckout", comfiProduct && !el.closest(CART_EXPRESS) ? {
+          value: comfiMoney(comfiProduct.price),
+          currency: comfiCurrency,
+          content_ids: [String(comfiProduct.id)],
+          content_type: "product",
+          contents: [{ id: String(comfiProduct.id), quantity: 1 }],
+          num_items: 1
+        } : comfiCartData());
+      } catch (err) {}
+    }
+    document.addEventListener("pointerdown", onExpressTap, true);
+    document.addEventListener("click", onExpressTap, true);
 
     // Normal checkout only: retain native forms and leave wallet buttons alone.
     var checkoutPending = false;

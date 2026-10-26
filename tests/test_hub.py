@@ -497,3 +497,79 @@ def test_cart_ids_beat_stored_ones_and_junk_counts_as_missing(app_client, wire):
     assert post_order(app_client, SECOND, SECOND_KEY, junk).status_code == 200
     # The cart's newer click was stored by the first order, so that is what fills the gap.
     assert purchase_user_data(wire, 7105)["fbc"] == cart
+
+
+# ============ ORDERS WITH NO VISITOR ID: MATCHED BY DEVICE ============
+# Shop Pay and other wallets skip the cart, and no pixel runs on their
+# checkout, so the order arrives with no visitor ID. The visitor is found by
+# the order's own IP and user agent, only when exactly one recent visitor fits.
+
+def landing(client, shop, vid, ip, fbc=None, event_name="PageView", ua=UA):
+    body = {"event_name": event_name, "event_id": "e-" + vid, "vid": vid,
+            "source_url": "https://x.example/en-gb/products/x", "shop": shop}
+    if fbc:
+        body["fbc"] = fbc
+        body["fbp"] = "fb.1.1793042396399.476937934158071451"
+    return client.post("/track", data=json.dumps(body), content_type="text/plain",
+                       headers={"User-Agent": ua, "X-Forwarded-For": ip})
+
+
+def wallet_order(order_id, ip, ua=UA, email="buyer@example.com"):
+    return {**order(order_id), "email": email, "browser_ip": ip, "client_details": {"user_agent": ua}}
+
+
+def test_shop_pay_order_finds_the_ad_visitor_by_device(app_client, wire):
+    fbc = click_id(0, "IwARshoppay" + "s" * 20)
+    assert landing(app_client, SECOND, "v_device00001", "92.40.215.157", fbc=fbc).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7201, "92.40.215.157")).status_code == 200
+    user = purchase_user_data(wire, 7201)
+    assert user["fbc"] == fbc
+    assert user["fbp"] == "fb.1.1793042396399.476937934158071451"
+    assert main.hash_data("v_device00001") in user["external_id"]
+
+
+def test_two_visitors_on_one_device_means_no_match(app_client, wire):
+    for vid in ("v_device00002", "v_device00003"):
+        assert landing(app_client, SECOND, vid, "10.9.8.7", fbc=click_id(0, "IwAR" + vid[-5:] * 4)).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7202, "10.9.8.7")).status_code == 200
+    user = purchase_user_data(wire, 7202)
+    assert "fbc" not in user and "fbp" not in user
+
+
+def test_device_match_needs_the_same_ip_and_user_agent(app_client, wire):
+    assert landing(app_client, SECOND, "v_device00004", "10.1.1.1", fbc=click_id(0, "IwARiponly" + "i" * 20)).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7203, "10.1.1.2")).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7203)
+    assert post_order(app_client, SECOND, SECOND_KEY,
+                      wallet_order(7204, "10.1.1.1", ua="Mozilla/5.0 (iPhone) Other/1.0")).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7204)
+
+
+def test_device_match_stays_in_its_own_store(app_client, wire):
+    assert landing(app_client, COMFI, "v_device00005", "10.2.2.2", fbc=click_id(0, "IwARcomfi" + "c" * 20)).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7205, "10.2.2.2")).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7205)
+
+
+def test_a_visitor_known_under_another_email_is_someone_else(app_client, wire):
+    assert landing(app_client, SECOND, "v_device00006", "10.3.3.3", fbc=click_id(0, "IwARother" + "o" * 20)).status_code == 200
+    first = {**wallet_order(7206, "10.3.3.3", email="first@example.com"),
+             "note_attributes": [{"name": "_comfi_vid", "value": "v_device00006"}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, first).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY,
+                      wallet_order(7207, "10.3.3.3", email="second@example.com")).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7207)
+
+
+def test_plain_page_views_are_not_stored(app_client, wire):
+    """Only ad visitors (a click ID) are written from a page view."""
+    assert landing(app_client, SECOND, "v_device00007", "10.4.4.4").status_code == 200
+    assert main.identity_record(SECOND, "v_device00007", write=False) == {}
+
+
+def test_the_cart_visitor_still_wins_over_a_device_match(app_client, wire):
+    assert landing(app_client, SECOND, "v_device00008", "10.5.5.5", fbc=click_id(0, "IwARdevice" + "d" * 20)).status_code == 200
+    body = {**wallet_order(7208, "10.5.5.5"), "note_attributes": [{"name": "_comfi_vid", "value": "v_cartvid0001"}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, body).status_code == 200
+    user = purchase_user_data(wire, 7208)
+    assert "fbc" not in user and main.hash_data("v_cartvid0001") in user["external_id"]

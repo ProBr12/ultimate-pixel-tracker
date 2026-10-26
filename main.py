@@ -504,6 +504,8 @@ def init_identity_db():
                     PRIMARY KEY (shop, vid)
                 );
                 CREATE INDEX IF NOT EXISTS meta_identity_updated ON meta_identity (updated_at);
+                -- device_match: orders with no visitor ID, found by IP and user agent
+                CREATE INDEX IF NOT EXISTS meta_identity_device ON meta_identity (shop, client_ip);
                 CREATE TABLE IF NOT EXISTS meta_checkout_signal (
                     shop TEXT NOT NULL,
                     checkout_token TEXT NOT NULL,
@@ -583,6 +585,46 @@ def identity_record(shop, vid, match=None, fbc=None, fbp=None,
         record["user_agent"] = ua
         record["client_ip"] = ip
     return record
+
+
+DEVICE_MATCH_WINDOW = timedelta(hours=3)
+
+DEVICE_MATCH_SELECT = """
+SELECT vid, match, fbc, fbp FROM meta_identity
+WHERE shop = %(shop)s AND client_ip = %(ip)s AND user_agent = %(ua)s
+  AND browser_seen_at > now() - %(window)s
+ORDER BY browser_seen_at DESC LIMIT 2
+"""
+
+
+def device_match(shop, client_ip, user_agent, email_hash=None):
+    """The visitor behind an order that arrived with no visitor ID (Shop Pay
+    and other express wallets skip the cart, and no pixel runs on their
+    checkout). Only a visitor seen on this store in the last few hours with
+    exactly the same IP and user agent counts, and only when they are the
+    only one: two candidates (a shared mobile or office IP) means no match.
+    A visitor already known under a different email is someone else.
+    Returns {vid, fbc, fbp} or {}."""
+    if not (DATABASE_URL and shop and isinstance(client_ip, str) and client_ip
+            and isinstance(user_agent, str) and user_agent):
+        return {}
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+        with conn, conn.cursor() as cur:
+            cur.execute(DEVICE_MATCH_SELECT, {"shop": shop, "ip": client_ip[:64], "ua": user_agent[:512],
+                                              "window": DEVICE_MATCH_WINDOW})
+            rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        logger.error(f"device match failed: {type(e).__name__}")
+        return {}
+    if len(rows) != 1:
+        return {}
+    vid, stored, fbc, fbp = rows[0]
+    stored_email = (stored or {}).get("em")
+    if email_hash and stored_email and stored_email != email_hash:
+        return {}
+    return {"vid": vid, "fbc": fbc, "fbp": fbp}
 
 
 def checkout_signal_claim(shop, token, event_name):
@@ -678,13 +720,25 @@ def order_created():
         fbp = fbp if valid_fbp(fbp) else (context.get("fbp") or "")
         fbc = fbc if valid_fbc(fbc) else (context.get("fbc") or "")
 
+    buyer = buyer_details(order)
+    match = buyer_match(buyer, config["default_country"])
+
+    # Still no visitor: Shop Pay and other wallets skip the cart and no pixel
+    # runs on their checkout. Find the visitor by this order's own device
+    # (same IP and user agent, recently, and only one such visitor).
+    client_details = order.get("client_details") or {}
+    device = {}
+    if not valid_vid(vid):
+        device = device_match(
+            shop, order.get("browser_ip") or client_details.get("browser_ip"),
+            client_details.get("user_agent") or context.get("user_agent"), match.get("em"))
+        vid = device.get("vid") or vid
+
     # Remember this buyer against their visitor ID, so their later visits
     # carry the email and phone they bought with. The stored row also holds
     # the click and browser IDs from this visitor's earlier events, and their
     # user agent and IP for when the order has none.
-    buyer = buyer_details(order)
-    known = identity_record(shop, vid, match=buyer_match(buyer, config["default_country"]),
-                            fbc=fbc, fbp=fbp)
+    known = identity_record(shop, vid, match=match, fbc=fbc, fbp=fbp)
 
     if not valid_fbc(fbc) and not valid_fbclid(fbclid):
         landing_site = order.get("landing_site", "") or ""
@@ -714,13 +768,13 @@ def order_created():
     logger.info(
         f"Identifiers for order {order_id}: vid={bool(vid)} fbc={bool(fbc)} fbp={bool(fbp)} "
         f"fbclid={bool(fbclid)} from_context={bool(context)} "
-        f"from_identity={','.join(from_identity) or '-'} utm_source={utm_source}")
+        f"from_identity={','.join(from_identity) or '-'} utm_source={utm_source}"
+        + (" from_device=True" if device else ""))
 
     total_price = order.get("total_price", "0")
     content_ids, contents, num_items = line_item_contents(order)
 
-    # Extract IP and User Agent from Shopify's client_details
-    client_details = order.get("client_details") or {}
+    # IP and user agent from Shopify's client_details (read above)
     browser_ip = (order.get("browser_ip") or client_details.get("browser_ip")
                   or known.get("client_ip") or "")
     browser_ua = (client_details.get("user_agent") or context.get("user_agent")
@@ -1211,7 +1265,11 @@ def track_event():
         region=extras.get("region"), country=extras.get("country"),
         default_country=config.get("default_country") or "GB")
     identified = "em" in own or "ph" in own
-    write = identified or event_name in ("AddToCart", "InitiateCheckout")
+    # Ad visitors are written from their first page too: someone who lands
+    # from an ad and pays with Shop Pay never adds to cart, and the order then
+    # arrives with nothing but their IP and user agent (see device_match).
+    write = (identified or event_name in ("AddToCart", "InitiateCheckout")
+             or valid_fbc(body.get("fbc")))
     known = identity_record(
         shop, vid, match=own if identified else None,
         fbc=body.get("fbc"), fbp=body.get("fbp"),

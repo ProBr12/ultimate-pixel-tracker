@@ -46,7 +46,7 @@ if (mode === "phone") {
   })();
 } else if (mode === "theme") {
   const scripts = JSON.parse(fs.readFileSync(codePath, "utf8"));
-  const cookies = {};
+  const cookies = Object.assign({}, input.cookies || {});
   const store = Object.assign({}, input.localStorage || {});
   const fetches = [];
   const listeners = {};
@@ -85,12 +85,22 @@ if (mode === "phone") {
   ctx.localStorage = window.localStorage;
   ctx.fetch = window.fetch;
   for (const code of scripts) vm.runInContext(code, ctx);
+  // Taps: an element matching one selector in the theme's own selector lists.
+  for (const tag of input.taps || []) {
+    const has = (sel) => sel.split(",").map((x) => x.trim()).indexOf(tag) !== -1;
+    const el = { closest: (sel) => (has(sel) ? el : null) };
+    for (const type of ["pointerdown", "click"]) {
+      for (const fn of listeners[type] || []) fn({ target: { closest: el.closest } });
+    }
+  }
   const queue = (ctx.fbq && ctx.fbq.queue) || [];
   setTimeout(() => {
     out({
       fbq: queue.map((args) => Array.from(args)),
       track: fetches.filter((f) => String(f.url).endsWith("/track")).map((f) => JSON.parse(f.body)),
       restored: ctx.comfiRestored,
+      cookies,
+      storage: store,
     });
   }, 20);
 }
