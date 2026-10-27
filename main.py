@@ -506,6 +506,9 @@ def init_identity_db():
                 CREATE INDEX IF NOT EXISTS meta_identity_updated ON meta_identity (updated_at);
                 -- device_match: orders with no visitor ID, found by IP and user agent
                 CREATE INDEX IF NOT EXISTS meta_identity_device ON meta_identity (shop, client_ip);
+                -- when this visitor last started checkout (device_match's second step)
+                ALTER TABLE meta_identity ADD COLUMN IF NOT EXISTS checkout_at TIMESTAMPTZ;
+                CREATE INDEX IF NOT EXISTS meta_identity_checkout ON meta_identity (shop, checkout_at);
                 CREATE TABLE IF NOT EXISTS meta_checkout_signal (
                     shop TEXT NOT NULL,
                     checkout_token TEXT NOT NULL,
@@ -588,6 +591,7 @@ def identity_record(shop, vid, match=None, fbc=None, fbp=None,
 
 
 DEVICE_MATCH_WINDOW = timedelta(hours=3)
+CHECKOUT_MATCH_WINDOW = timedelta(minutes=20)
 
 DEVICE_MATCH_SELECT = """
 SELECT vid, match, fbc, fbp FROM meta_identity
@@ -596,35 +600,67 @@ WHERE shop = %(shop)s AND client_ip = %(ip)s AND user_agent = %(ua)s
 ORDER BY browser_seen_at DESC LIMIT 2
 """
 
+# Same browser, started checkout minutes ago. No IP: the hub only sees IPv4,
+# while about a third of UK shoppers reach Shopify's checkout over IPv6.
+CHECKOUT_MATCH_SELECT = """
+SELECT vid, match, fbc, fbp FROM meta_identity
+WHERE shop = %(shop)s AND user_agent = %(ua)s
+  AND checkout_at > now() - %(window)s
+ORDER BY checkout_at DESC LIMIT 2
+"""
+
 
 def device_match(shop, client_ip, user_agent, email_hash=None):
     """The visitor behind an order that arrived with no visitor ID (Shop Pay
     and other express wallets skip the cart, and no pixel runs on their
-    checkout). Only a visitor seen on this store in the last few hours with
-    exactly the same IP and user agent counts, and only when they are the
-    only one: two candidates (a shared mobile or office IP) means no match.
-    A visitor already known under a different email is someone else.
-    Returns {vid, fbc, fbp} or {}."""
-    if not (DATABASE_URL and shop and isinstance(client_ip, str) and client_ip
-            and isinstance(user_agent, str) and user_agent):
+    checkout). Two steps, each needing exactly one candidate (two or more
+    means no match), and a visitor already known under a different email is
+    someone else:
+      1. "ip": the same IP and user agent, seen on this store in the last 3 hours
+      2. "checkout": the same user agent, started checkout on this store in the
+         last 20 minutes (tapping Shop Pay or Apple Pay counts)
+    Returns {vid, fbc, fbp, how} or {}."""
+    if not (DATABASE_URL and shop and isinstance(user_agent, str) and user_agent):
         return {}
+    steps = []
+    if isinstance(client_ip, str) and client_ip:
+        steps.append(("ip", DEVICE_MATCH_SELECT,
+                      {"shop": shop, "ip": client_ip[:64], "ua": user_agent[:512], "window": DEVICE_MATCH_WINDOW}))
+    steps.append(("checkout", CHECKOUT_MATCH_SELECT,
+                  {"shop": shop, "ua": user_agent[:512], "window": CHECKOUT_MATCH_WINDOW}))
     try:
         conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+        found = {}
         with conn, conn.cursor() as cur:
-            cur.execute(DEVICE_MATCH_SELECT, {"shop": shop, "ip": client_ip[:64], "ua": user_agent[:512],
-                                              "window": DEVICE_MATCH_WINDOW})
-            rows = cur.fetchall()
+            for how, query, params in steps:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+                if len(rows) != 1:
+                    continue
+                vid, stored, fbc, fbp = rows[0]
+                stored_email = (stored or {}).get("em")
+                if email_hash and stored_email and stored_email != email_hash:
+                    continue
+                found = {"vid": vid, "fbc": fbc, "fbp": fbp, "how": how}
+                break
         conn.close()
+        return found
     except Exception as e:
         logger.error(f"device match failed: {type(e).__name__}")
         return {}
-    if len(rows) != 1:
-        return {}
-    vid, stored, fbc, fbp = rows[0]
-    stored_email = (stored or {}).get("em")
-    if email_hash and stored_email and stored_email != email_hash:
-        return {}
-    return {"vid": vid, "fbc": fbc, "fbp": fbp}
+
+
+def note_checkout_started(shop, vid):
+    """Remember when this visitor started checkout, for device_match."""
+    if not (DATABASE_URL and shop and valid_vid(vid)):
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+        with conn, conn.cursor() as cur:
+            cur.execute("UPDATE meta_identity SET checkout_at = now() WHERE shop = %s AND vid = %s", (shop, vid))
+        conn.close()
+    except Exception as e:
+        logger.error(f"checkout note failed: {type(e).__name__}")
 
 
 def checkout_signal_claim(shop, token, event_name):
@@ -769,7 +805,7 @@ def order_created():
         f"Identifiers for order {order_id}: vid={bool(vid)} fbc={bool(fbc)} fbp={bool(fbp)} "
         f"fbclid={bool(fbclid)} from_context={bool(context)} "
         f"from_identity={','.join(from_identity) or '-'} utm_source={utm_source}"
-        + (" from_device=True" if device else ""))
+        + (f" from_device={device['how']}" if device else ""))
 
     total_price = order.get("total_price", "0")
     content_ids, contents, num_items = line_item_contents(order)
@@ -1274,6 +1310,8 @@ def track_event():
         shop, vid, match=own if identified else None,
         fbc=body.get("fbc"), fbp=body.get("fbp"),
         user_agent=user_agent, client_ip=client_ip, write=write)
+    if event_name == "InitiateCheckout" and not woo_options:
+        note_checkout_started(shop, vid)
 
     restored = body.get("restored")
     restored = restored if isinstance(restored, str) and re.fullmatch(r"[a-z_,]{1,40}", restored) else ""

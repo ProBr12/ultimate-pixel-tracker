@@ -573,3 +573,86 @@ def test_the_cart_visitor_still_wins_over_a_device_match(app_client, wire):
     assert post_order(app_client, SECOND, SECOND_KEY, body).status_code == 200
     user = purchase_user_data(wire, 7208)
     assert "fbc" not in user and main.hash_data("v_cartvid0001") in user["external_id"]
+
+
+# ============ ORDERS WITH NO VISITOR ID: MATCHED BY A RECENT CHECKOUT START ============
+# The hub only sees IPv4, while many UK buyers reach Shopify's checkout over
+# IPv6, so the IP step cannot find them. Second step: the same user agent
+# started checkout on this store in the last 20 minutes, and only one did.
+
+def started_checkout(client, shop, vid, ua, ip="81.2.3.4", fbc=None):
+    body = {"event_name": "InitiateCheckout", "event_id": "ic-" + vid, "vid": vid,
+            "source_url": "https://x.example/products/x", "shop": shop,
+            "fbc": fbc or click_id(0, "IwARtap" + vid[-6:] * 4), "fbp": "fb.1.1793042396399.123456789"}
+    return client.post("/track", data=json.dumps(body), content_type="text/plain",
+                       headers={"User-Agent": ua, "X-Forwarded-For": ip})
+
+
+def ua(tag):
+    return f"Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) Mobile/22H374 [FBAN/FBIOS;FBDV/{tag}]"
+
+
+IPV6 = "2a00:23c8:6dfe:2101:c30b:d9de:36c:209c"
+
+
+def test_ipv6_shop_pay_order_finds_the_visitor_who_started_checkout(app_client, wire):
+    fbc = click_id(0, "IwARipv6buyer" + "b" * 20)
+    assert started_checkout(app_client, SECOND, "v_tap0000001", ua("tap1"), fbc=fbc).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7301, IPV6, ua=ua("tap1"))).status_code == 200
+    user = purchase_user_data(wire, 7301)
+    assert user["fbc"] == fbc and main.hash_data("v_tap0000001") in user["external_id"]
+
+
+def test_checkout_started_too_long_ago_is_no_match(app_client, wire):
+    assert started_checkout(app_client, SECOND, "v_tap0000002", ua("tap2")).status_code == 200
+    import psycopg2
+    conn = psycopg2.connect(main.DATABASE_URL)
+    with conn, conn.cursor() as cur:
+        cur.execute("UPDATE meta_identity SET checkout_at = now() - interval '25 minutes' WHERE vid = 'v_tap0000002'")
+    conn.close()
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7302, IPV6, ua=ua("tap2"))).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7302)
+
+
+def test_two_checkout_starters_on_the_same_browser_type_is_no_match(app_client, wire):
+    for vid in ("v_tap0000003", "v_tap0000004"):
+        assert started_checkout(app_client, SECOND, vid, ua("tap3")).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7303, IPV6, ua=ua("tap3"))).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7303)
+
+
+def test_a_different_browser_is_no_match(app_client, wire):
+    assert started_checkout(app_client, SECOND, "v_tap0000005", ua("tap5")).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7304, IPV6, ua=ua("tap5-other"))).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7304)
+
+
+def test_page_views_alone_never_count_as_starting_checkout(app_client, wire):
+    assert landing(app_client, SECOND, "v_tap0000006", "81.9.9.9",
+                   fbc=click_id(0, "IwARbrowseonly" + "x" * 20), ua=ua("tap6")).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7305, IPV6, ua=ua("tap6"))).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7305)
+
+
+def test_checkout_starter_known_under_another_email_is_no_match(app_client, wire):
+    assert started_checkout(app_client, SECOND, "v_tap0000007", ua("tap7")).status_code == 200
+    first = {**wallet_order(7306, IPV6, ua=ua("tap7"), email="earlier@example.com"),
+             "note_attributes": [{"name": "_comfi_vid", "value": "v_tap0000007"}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, first).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY,
+                      wallet_order(7307, IPV6, ua=ua("tap7"), email="someone.else@example.com")).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7307)
+
+
+def test_checkout_match_stays_in_its_own_store(app_client, wire):
+    assert started_checkout(app_client, COMFI, "v_tap0000008", ua("tap8")).status_code == 200
+    assert post_order(app_client, SECOND, SECOND_KEY, wallet_order(7308, IPV6, ua=ua("tap8"))).status_code == 200
+    assert "fbc" not in purchase_user_data(wire, 7308)
+
+
+def test_orders_that_already_have_a_visitor_never_use_the_checkout_match(app_client, wire):
+    assert started_checkout(app_client, SECOND, "v_tap0000009", ua("tap9")).status_code == 200
+    body = {**wallet_order(7309, IPV6, ua=ua("tap9")), "note_attributes": [{"name": "_comfi_vid", "value": "v_ownvisitor1"}]}
+    assert post_order(app_client, SECOND, SECOND_KEY, body).status_code == 200
+    user = purchase_user_data(wire, 7309)
+    assert "fbc" not in user and main.hash_data("v_ownvisitor1") in user["external_id"]
