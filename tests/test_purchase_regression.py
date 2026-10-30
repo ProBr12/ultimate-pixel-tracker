@@ -16,7 +16,7 @@ CAPTURE = os.path.join(REPO, "tests", "purchase_capture.py")
 
 def export_commit(commit, target):
     os.makedirs(target, exist_ok=True)
-    for name in ("main.py", "stores.py", "hub.py"):
+    for name in ("main.py", "stores.py", "hub.py", "alerts.py"):
         source = subprocess.run(["git", "-C", REPO, "show", f"{commit}:{name}"],
                                 check=True, capture_output=True).stdout
         with open(os.path.join(target, name), "wb") as f:

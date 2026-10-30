@@ -119,6 +119,9 @@ ALTER TABLE stores ADD COLUMN IF NOT EXISTS tracking_host TEXT;
 -- in Events Manager can send events but not read the pixel's name, so for
 -- those this, not the name lookup, is what confirms the token works.
 ALTER TABLE stores ADD COLUMN IF NOT EXISTS pixel_verified_at TIMESTAMPTZ;
+-- More pixels (e.g. one in a second Business Manager) that get every event too:
+-- an encrypted JSON list of {"pixel_id", "access_token"}. Empty: main pixel only.
+ALTER TABLE stores ADD COLUMN IF NOT EXISTS extra_pixels_enc TEXT;
 CREATE TABLE IF NOT EXISTS hub_migrations (
     name TEXT PRIMARY KEY,
     done_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -225,7 +228,7 @@ CACHE_SECONDS = 30
 STORE_COLUMNS = ("id", "account_id", "platform", "name", "shop_domain", "site_url", "pixel_id",
                  "access_token_enc", "webhook_secret_enc", "test_event_code", "default_country",
                  "currency", "enabled", "uses_env_credentials", "pixel_name", "pixel_checked_at",
-                 "pixel_check_error", "created_at", "updated_at", "tracking_host")
+                 "pixel_check_error", "created_at", "updated_at", "tracking_host", "extra_pixels_enc")
 # The hub's pages also read when the token was last confirmed by a test event.
 # Kept out of store_config, the per-event lookup, so tracking never depends on it.
 HUB_COLUMNS = STORE_COLUMNS + ("pixel_verified_at",)
@@ -240,7 +243,27 @@ def _row_to_store(row, columns=STORE_COLUMNS):
         os.environ.get("SHOPIFY_WEBHOOK_SECRET") if env else None)
     if env and not store["pixel_id"]:
         store["pixel_id"] = os.environ.get("PIXEL_ID")
+    store["extra_pixels"] = read_extra_pixels(store.get("extra_pixels_enc"), store["pixel_id"])
     return store
+
+
+def read_extra_pixels(token, main_pixel=None):
+    """The store's extra pixels as [{"pixel_id", "access_token"}], skipping
+    anything malformed and the main pixel itself (never send an event twice)."""
+    text = decrypt(token) if token else None
+    try:
+        items = json.loads(text) if text else []
+    except ValueError:
+        return []
+    pixels, seen = [], {main_pixel}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        pid, tok = str(item.get("pixel_id") or ""), item.get("access_token")
+        if PIXEL_ID_RE.fullmatch(pid) and isinstance(tok, str) and tok and pid not in seen:
+            seen.add(pid)
+            pixels.append({"pixel_id": pid, "access_token": tok})
+    return pixels
 
 
 def store_config(shop):
@@ -301,6 +324,8 @@ def save_store(values, store_id=None):
         fields["access_token_enc"] = encrypt(values["access_token"])
     if values.get("webhook_secret"):
         fields["webhook_secret_enc"] = encrypt(values["webhook_secret"])
+    if "extra_pixels" in values:
+        fields["extra_pixels_enc"] = encrypt(json.dumps(values["extra_pixels"])) if values["extra_pixels"] else None
     with db() as conn, conn.cursor() as cur:
         if store_id is None:
             fields["id"] = values["id"]

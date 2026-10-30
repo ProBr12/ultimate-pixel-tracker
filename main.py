@@ -10,6 +10,7 @@ import logging
 import re
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
@@ -268,7 +269,8 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     external_id=None, content_ids=None, content_type=None,
                     contents=None, num_items=None, order_id=None,
                     pixel_id=None, access_token=None, matched=None,
-                    test_event_code=None, log=None, default_country="GB"):
+                    test_event_code=None, log=None, default_country="GB",
+                    extra_pixels=None):
 
     PIXEL_ID = pixel_id if pixel_id is not None else os.environ.get("PIXEL_ID")
     ACCESS_TOKEN = access_token if access_token is not None else os.environ.get("ACCESS_TOKEN")
@@ -341,6 +343,15 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
     if test_event_code:
         payload["test_event_code"] = test_event_code
 
+    # The same event, same event ID, to each extra pixel (e.g. one in another
+    # Business Manager). Sent off the request path so the main pixel's timing and
+    # result never depend on them; their failures are logged, never raised.
+    # No test_event_code: those belong to the main pixel only.
+    for extra in extra_pixels or ():
+        if extra.get("pixel_id") and extra["pixel_id"] != PIXEL_ID:
+            EXTRA_PIXEL_POOL.submit(send_to_extra_pixel, extra, {"data": payload["data"], "access_token": extra["access_token"]},
+                                    event_name, list(user_data.keys()), log)
+
     try:
         response = requests.post(
             f"https://graph.facebook.com/v19.0/{PIXEL_ID}/events",
@@ -359,6 +370,28 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
         stores.log_delivery(log.get("shop"), event_name, log.get("source"), user_data.keys(),
                             response.status_code, None if ok else response.text,
                             log.get("version"), log.get("restored"))
+    return response
+
+
+EXTRA_PIXEL_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="extra-pixel")
+
+
+def send_to_extra_pixel(extra, payload, event_name, keys, log):
+    pid = extra["pixel_id"]
+    source = f"extra:{(log or {}).get('source') or 'server'}"
+    try:
+        response = requests.post(f"https://graph.facebook.com/v19.0/{pid}/events", json=payload, timeout=10)
+    except requests.RequestException as e:
+        logger.error(f"Extra pixel {pid} send failed: {event_name} | {type(e).__name__}")
+        if log:
+            stores.log_delivery(log.get("shop"), event_name, source, keys, 0,
+                                f"pixel {pid}: {type(e).__name__}", log.get("version"), log.get("restored"))
+        return None
+    ok = 200 <= response.status_code < 300
+    logger.info(f"Extra pixel {pid} response: {response.status_code}{'' if ok else ' ' + response.text}")
+    if log:
+        stores.log_delivery(log.get("shop"), event_name, source, keys, response.status_code,
+                            None if ok else f"pixel {pid}: {response.text}", log.get("version"), log.get("restored"))
     return response
 
 
@@ -854,6 +887,7 @@ def order_created():
         order_id=order_id,
         pixel_id=config["pixel_id"],
         access_token=config["access_token"],
+        extra_pixels=config.get("extra_pixels"),
         default_country=config["default_country"],
         log={"shop": shop, "source": "webhook"}
     )
@@ -1000,6 +1034,7 @@ def handle_checkout(shop, config, checkout):
             content_ids=content_ids, content_type="product",
             contents=contents, num_items=num_items,
             pixel_id=config["pixel_id"], access_token=config["access_token"],
+            extra_pixels=config.get("extra_pixels"),
             default_country=config["default_country"],
             log={"shop": shop, "source": "webhook"})
         delivered = 200 <= response.status_code < 300
@@ -1363,7 +1398,7 @@ def track_event():
         external_id=vid,
         matched=known.get("match"),
         default_country=config.get("default_country") or "GB",
-        **{k: v for k, v in config.items() if k in ("pixel_id", "access_token")},
+        **{k: v for k, v in config.items() if k in ("pixel_id", "access_token", "extra_pixels")},
         **extras,
         log={"shop": shop, "source": "woo-relay" if woo_options else "browser",
              "version": version, "restored": restored}

@@ -24,8 +24,8 @@ from phonenumbers import PhoneMetadata
 import alerts
 import stores
 
-SNIPPET_VERSION = 8
-CHECKOUT_PIXEL_VERSION = 3
+SNIPPET_VERSION = 9
+CHECKOUT_PIXEL_VERSION = 4
 bp = Blueprint("hub", __name__, url_prefix="/hub")
 _send_capi_event = None
 
@@ -363,7 +363,8 @@ FUNNEL_ORDER = ["PageView", "ViewContent", "AddToCart", "InitiateCheckout", "Add
 def store_facts(shop):
     """Everything the status, health and setup views need about one store."""
     facts = {"events": [], "errors": [], "receipts": {}, "last_browser": None, "version": None,
-             "checkout_pixel_seen": None, "checkout_pixel_version": None, "total": 0, "accepted": 0, "purchases": 0, "apinfo_7d": 0, "restores_7d": 0, "identified": 0}
+             "checkout_pixel_seen": None, "checkout_pixel_version": None, "total": 0, "accepted": 0, "purchases": 0, "apinfo_7d": 0, "restores_7d": 0, "identified": 0,
+             "extra_total": 0, "extra_ok": 0}
     if not shop:
         return facts
     key_sql = ", ".join("count(*) FILTER (WHERE %s = ANY(keys))" for _ in KEY_COLUMNS)
@@ -371,7 +372,8 @@ def store_facts(shop):
         cur.execute(
             f"""SELECT event_name, count(*), count(*) FILTER (WHERE status BETWEEN 200 AND 299), {key_sql}
                 FROM meta_deliveries
-                WHERE shop = %s AND source <> 'test' AND ts > now() - interval '24 hours'
+                WHERE shop = %s AND source <> 'test' AND source NOT LIKE 'extra:%%'
+                  AND ts > now() - interval '24 hours'
                 GROUP BY event_name""",
             [k for k, _ in KEY_COLUMNS] + [shop])
         for row in cur.fetchall():
@@ -391,8 +393,14 @@ def store_facts(shop):
         facts["version"] = row[0] if row else None
         cur.execute("""SELECT count(*) FILTER (WHERE event_name = 'AddPaymentInfo' AND status BETWEEN 200 AND 299),
                               count(*) FILTER (WHERE restored IS NOT NULL)
-                       FROM meta_deliveries WHERE shop = %s AND ts > now() - interval '7 days'""", (shop,))
+                       FROM meta_deliveries WHERE shop = %s AND source NOT LIKE 'extra:%%'
+                         AND ts > now() - interval '7 days'""", (shop,))
         facts["apinfo_7d"], facts["restores_7d"] = cur.fetchone()
+        # Copies sent to the store's extra pixels (other Business Managers).
+        cur.execute("""SELECT count(*), count(*) FILTER (WHERE status BETWEEN 200 AND 299)
+                       FROM meta_deliveries WHERE shop = %s AND source LIKE 'extra:%%'
+                         AND ts > now() - interval '24 hours'""", (shop,))
+        facts["extra_total"], facts["extra_ok"] = cur.fetchone()
         cur.execute("""SELECT ts, event_name, source, status, error FROM meta_deliveries
                        WHERE shop = %s AND (status < 200 OR status > 299) AND ts > now() - interval '7 days'
                        ORDER BY ts DESC LIMIT 8""", (shop,))
@@ -521,6 +529,8 @@ def read_store_form(existing=None):
         "tracking_host": re.sub(r"^https?://", "", f.get("tracking_host", "").strip().lower()).strip("/") or None,
         "enabled": f.get("enabled") == "on" if existing else True,
     }
+    extra_id = f.get("extra_pixel_id", "").strip()
+    extra_token = f.get("extra_access_token", "").strip()
     if not 2 <= len(values["name"]) <= 60:
         return None, "Give the store a name (2 to 60 characters)."
     if not values["shop_domain"]:
@@ -548,6 +558,23 @@ def read_store_form(existing=None):
         return None, "The tracking address must look like track.yourstore.com."
     if values["test_event_code"] and not stores.TEST_CODE_RE.fullmatch(values["test_event_code"]):
         return None, "The test event code looks like TEST12345 (from Events Manager, Test events)."
+    # Extra pixel: every event also goes here (e.g. a pixel in a second Business
+    # Manager). Blank ID removes it; blank token keeps the saved one for that ID.
+    if not extra_id:
+        values["extra_pixels"] = []
+    else:
+        if not stores.PIXEL_ID_RE.fullmatch(extra_id):
+            return None, "The extra pixel ID is the long number shown in Events Manager (digits only)."
+        if extra_id == values["pixel_id"]:
+            return None, "The extra pixel must be a different pixel from the main one."
+        if extra_token and not re.fullmatch(r"[A-Za-z0-9]{40,600}", extra_token):
+            return None, "That extra pixel access token does not look right. Copy it again from Events Manager."
+        if not extra_token:
+            saved = {x["pixel_id"]: x["access_token"] for x in (existing or {}).get("extra_pixels") or []}
+            extra_token = saved.get(extra_id)
+        if not extra_token:
+            return None, "Add the Conversions API access token for the extra pixel (made in its own Business Manager)."
+        values["extra_pixels"] = [{"pixel_id": extra_id, "access_token": extra_token}]
     return values, None
 
 
@@ -582,6 +609,12 @@ Send this store's events to Meta</label>"""
 <label>Tracking address (optional)<span>A subdomain of the store's own site, like track.yourstore.com, where shoppers'
 browsers send events. The Setup tab shows how to point it at the hub. Leave empty to use the hub's address.</span>
 <input type="text" name="tracking_host" value="{esc(s.get('tracking_host'))}" placeholder="track.yourstore.com"></label>
+<label>Extra pixel ID (optional)<span>A second pixel that gets every event too, browser and server, with the
+same event IDs. For a pixel in another Business Manager. Leave empty for none; clearing it stops sending there.
+After changing it, copy the tracking code and checkout pixel again from Setup.</span>
+<input type="text" name="extra_pixel_id" value="{esc(((s.get('extra_pixels') or [{}])[0]).get('pixel_id'))}" inputmode="numeric"></label>
+<label>Extra pixel access token<span>Generated on the extra pixel's own Settings page. {keep}</span>
+<input type="password" name="extra_access_token"></label>
 <label>Test event code (optional)<span>Events Manager, Test events. Only the hub's test button uses it.</span>
 <input type="text" name="test_event_code" value="{esc(s.get('test_event_code'))}" placeholder="TEST12345"></label>
 {enabled}
@@ -776,6 +809,11 @@ def health_view(store, facts):
 <div><b>{facts['apinfo_7d']:,}</b><span>Checkout identities sent, 7 days</span></div>
 <div><b>{facts['restores_7d']:,}</b><span>Safari wipes undone, 7 days</span></div>
 <div><b>{facts['identified']:,}</b><span>Visitors we can name</span></div></div>"""
+    if store.get("extra_pixels"):
+        ids = ", ".join(esc(x["pixel_id"]) for x in store["extra_pixels"])
+        share = f"{pct(facts['extra_ok'], facts['extra_total'])}% accepted" if facts["extra_total"] else "none yet"
+        figures += (f'<p class="muted">Also sending every event to pixel {ids}: '
+                    f'{facts["extra_total"]:,} server events in 24h, {share}.</p>')
     version = facts["version"]
     code_note = ""
     if facts["last_browser"] and version != SNIPPET_VERSION:
@@ -1119,12 +1157,12 @@ __PHONE_JS__
   if (country === "us") zp = zp.slice(0, 5);
   if (zp) m.zp = zp;
   window.comfiMatch = m;
-  fbq('init', '__PIXEL_ID__', m);
+  fbq('init', '__PIXEL_ID__', m);__EXTRA_INITS__
 })();
 </script>
 <noscript><img height="1" width="1" style="display:none"
 src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1"
-/></noscript>
+/></noscript>__EXTRA_NOSCRIPT__
 <!-- End Meta Pixel Base Code -->
 
 <!-- Tracking: visitor ID, click and browser IDs, browser + server events -->
@@ -1606,7 +1644,15 @@ def safe_store_name(store):
 
 
 def render_snippet(store, track_url):
+    # Every fbq("track") goes to each initialised pixel, so one init per extra
+    # pixel is all the browser side needs; the event IDs stay shared.
+    extras = [x for x in store.get("extra_pixels") or [] if stores.PIXEL_ID_RE.fullmatch(x["pixel_id"])]
     return (SNIPPET_TEMPLATE.replace("__PHONE_JS__", PHONE_JS)
+            .replace("__EXTRA_INITS__", "".join(f"\n  fbq('init', '{x['pixel_id']}', m);" for x in extras))
+            .replace("__EXTRA_NOSCRIPT__", "".join(
+                f'\n<noscript><img height="1" width="1" style="display:none"\n'
+                f'src="https://www.facebook.com/tr?id={x["pixel_id"]}&ev=PageView&noscript=1"\n/></noscript>'
+                for x in extras))
             .replace("__PIXEL_ID__", store["pixel_id"] or "")
             .replace("__TRACK_URL__", track_url)
             .replace("__VERSION__", str(SNIPPET_VERSION))
@@ -1626,6 +1672,7 @@ CHECKOUT_PIXEL_TEMPLATE = r'''// __STORE_NAME__ Meta checkout pixel v__VERSION__
 // Shopify admin, Settings, Customer events, custom pixel. Re-paste from the
 // hub's Setup tab when it says this code is out of date.
 const PIXEL_ID = __PIXEL_ID__;
+const EXTRA_PIXEL_IDS = __EXTRA_PIXEL_IDS__;
 const CONTEXT_URL = __CONTEXT_URL__;
 const SHOP = __SHOP__;
 const DEFAULT_COUNTRY = __DEFAULT_COUNTRY__;
@@ -1737,6 +1784,7 @@ async function sendPurchase(event) {
     });
     loadMetaPixel();
     window.fbq("init", PIXEL_ID, userData);
+    EXTRA_PIXEL_IDS.forEach((id) => window.fbq("init", id, userData));
     const params = { value: value, currency: currency, order_id: orderId };
     if (contents.length) {
       params.contents = contents;
@@ -1761,6 +1809,8 @@ if (thisShop === SHOP) {
 def render_checkout_pixel(store, context_url):
     return (CHECKOUT_PIXEL_TEMPLATE.replace("__PHONE_JS__", PHONE_JS)
             .replace("__PIXEL_ID__", json.dumps(store["pixel_id"] or ""))
+            .replace("__EXTRA_PIXEL_IDS__", json.dumps(
+                [x["pixel_id"] for x in store.get("extra_pixels") or [] if stores.PIXEL_ID_RE.fullmatch(x["pixel_id"])]))
             .replace("__CONTEXT_URL__", json.dumps(context_url))
             .replace("__SHOP__", json.dumps(store["shop_domain"] or ""))
             .replace("__DEFAULT_COUNTRY__", json.dumps(store.get("default_country") or "GB"))
