@@ -15,7 +15,8 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Blueprint, Response, abort, redirect, request, session
@@ -772,7 +773,7 @@ def store_page(store_id):
     except Exception:
         facts = None
     state, _ = store_status(store, facts)
-    tab = tab if tab in ("health", "funnel", "setup", "settings") else ("health" if state != "setup" else "setup")
+    tab = tab if tab in ("health", "sales", "funnel", "setup", "settings") else ("health" if state != "setup" else "setup")
     if request.args.get("saved"):
         notice = '<p class="note good">Saved.</p>'
     if tab == "settings":
@@ -781,6 +782,8 @@ def store_page(store_id):
         body = setup_view(store, facts)
     elif tab == "funnel":
         body = funnel_view(store)
+    elif tab == "sales":
+        body = sales_view(store)
     else:
         body = health_view(store, facts)
     return page(store["name"], header(store, tab, facts) + body, active=store_id)
@@ -790,7 +793,8 @@ def header(store, tab, facts=None):
     state, reason = store_status(store, facts)
     links = "".join(
         f'<a class="{"on" if tab == key else ""}" href="/hub/stores/{esc(store["id"])}?tab={key}">{label}</a>'
-        for key, label in (("health", "Health"), ("funnel", "Funnel"), ("setup", "Setup"), ("settings", "Settings")))
+        for key, label in (("health", "Health"), ("sales", "Sales by ad"), ("funnel", "Funnel"), ("setup", "Setup"),
+                           ("settings", "Settings")))
     site = esc(store["site_url"] or "")
     return f"""<h1>{esc(store['name'])}</h1>
 <p class="sub"><a href="{site}" rel="noopener" target="_blank">{site}</a>, pixel {esc(store['pixel_id'])}</p>
@@ -1960,3 +1964,152 @@ def funnel_view(store):
 <th class="num">Cart</th><th class="num">Checkout</th><th class="num">Bought</th><th class="num">Revenue</th></tr></thead><tbody>{ad_rows}</tbody></table></div>
 <h2>By day</h2><div class="scroll"><table><thead><tr><th>Day</th><th class="num">Sessions</th><th class="num">Product page</th>
 <th class="num">Cart</th><th class="num">Bought</th><th class="num">Revenue</th></tr></thead><tbody>{day_rows}</tbody></table></div>"""
+
+
+# ============ SALES BY AD ============
+# Every real order once, credited to the last ad click before it: the newest
+# page view by that buyer's visitor ID (up to 28 days back) whose link carried
+# ad tags, else the order's own landing page. One order, one ad, so two ad
+# accounts can never both claim it. Ads need these URL parameters:
+#   utm_source=facebook&utm_medium=paid&utm_campaign={{campaign.id}}
+#   &utm_content={{ad.id}}&utm_term={{adset.id}}&utm_id=<account label>
+
+SALES_TZ = ZoneInfo("Europe/London")
+SALES_LOOKBACK_DAYS = 28
+META_SOURCES = {"facebook", "fb", "instagram", "ig", "meta", "an", "msg", "messenger"}
+SALES_SQL = """
+SELECT p.order_id, p.ts, p.value, p.url,
+       (SELECT e.url FROM events e
+         WHERE e.shop = p.shop AND e.vid = p.vid AND e.event_name <> 'Purchase'
+           AND e.ts <= p.ts AND e.ts > p.ts - make_interval(days => %(lookback)s)
+           AND e.url ~ '[?&](utm_source|utm_content|fbclid|gclid|gbraid|wbraid)='
+         ORDER BY e.ts DESC LIMIT 1) AS click_url
+FROM (SELECT DISTINCT ON (order_id) order_id, vid, ts, value, url, shop FROM events
+      WHERE shop = %(shop)s AND event_name = 'Purchase' AND order_id IS NOT NULL
+        AND ts >= %(start)s AND ts < %(end)s
+      ORDER BY order_id, ts) p
+ORDER BY p.ts DESC
+"""
+
+
+def sales_period(key):
+    """(start, end, label) in UTC for today/yesterday (UK days) or the last N days."""
+    now = datetime.now(SALES_TZ)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if key == "yesterday":
+        return midnight - timedelta(days=1), midnight, "Yesterday"
+    if key in ("7", "30"):
+        return now - timedelta(days=int(key)), now, f"Last {key} days"
+    return midnight, now + timedelta(minutes=1), "Today"
+
+
+def ad_click(url):
+    """What a tagged link says about the click: channel, account, campaign, ad set, ad."""
+    if not url:
+        return None
+    q = parse_qs(urlparse(url).query)
+
+    def first(key):
+        value = (q.get(key) or [""])[0].strip()
+        return value[:120] or None
+
+    source = (first("utm_source") or "").lower()
+    if first("fbclid") or source in META_SOURCES:
+        channel = "meta"
+    elif first("gclid") or first("gbraid") or first("wbraid") or source in ("google", "adwords"):
+        channel = "google"
+    elif source:
+        channel = "other"
+    else:
+        return None
+    return {"channel": channel, "source": source or channel, "account": first("utm_id"),
+            "campaign": first("utm_campaign"), "adset": first("utm_term"),
+            "ad": first("ad_name") or first("utm_content")}
+
+
+def credit(click_url, landing_url):
+    """The click an order is credited to: the buyer's last tagged visit, else the order's landing page."""
+    return ad_click(click_url) or ad_click(landing_url)
+
+
+def sales_view(store):
+    key = request.args.get("period", "today")
+    start, end, label = sales_period(key)
+    try:
+        with stores.db() as conn, conn.cursor() as cur:
+            cur.execute(SALES_SQL, {"shop": store["shop_domain"], "start": start, "end": end,
+                                    "lookback": SALES_LOOKBACK_DAYS})
+            rows = cur.fetchall()
+    except Exception:
+        return '<p class="note bad">Sales could not be loaded right now. Reload in a minute.</p>'
+    sid = esc(store["id"])
+    ranges = "".join(
+        f'<a href="/hub/stores/{sid}?tab=sales&period={k}"{" aria-current=page" if k == key or (k == "today" and key not in ("yesterday", "7", "30")) else ""}>'
+        f'{"<b>" + name + "</b>" if k == key or (k == "today" and key not in ("yesterday", "7", "30")) else name}</a>'
+        for k, name in (("today", "Today"), ("yesterday", "Yesterday"), ("7", "7 days"), ("30", "30 days")))
+    intro = (f'<p class="range">{ranges}</p><p class="muted">Every real order counted once, credited to the last ad '
+             f'the buyer clicked (up to {SALES_LOOKBACK_DAYS} days before). Two ad accounts can never both claim the same '
+             'sale here, unlike in Ads Manager. Times are UK time.</p>')
+    if not rows:
+        return intro + f'<div class="panel empty">No orders {esc(label.lower())} yet.</div>'
+
+    cur_sign = store["currency"]
+    orders, accounts, ads = [], {}, {}
+    totals = {"meta_ad": [0, 0.0], "meta_no_ad": [0, 0.0], "other": [0, 0.0], "none": [0, 0.0]}
+    for order_id, ts, value, landing, click_url in rows:
+        value = float(value or 0)
+        c = credit(click_url, landing)
+        if c and c["channel"] == "meta" and c["ad"]:
+            bucket = "meta_ad"
+            account = c["account"] or "Not tagged"
+            what = f"{account} / ad {c['ad']}"
+            acc = accounts.setdefault(account, [0, 0.0])
+            acc[0] += 1
+            acc[1] += value
+            ad = ads.setdefault((account, c["campaign"] or "-", c["adset"] or "-", c["ad"]), [0, 0.0])
+            ad[0] += 1
+            ad[1] += value
+        elif c and c["channel"] == "meta":
+            bucket, what = "meta_no_ad", "Meta ad, no ad ID in the link"
+        elif c:
+            bucket, what = "other", f"{c['source'].capitalize()}" + (f" / {c['campaign']}" if c["campaign"] else "")
+        else:
+            bucket, what = "none", "No ad click found"
+        totals[bucket][0] += 1
+        totals[bucket][1] += value
+        orders.append((ts, order_id, value, what))
+
+    n, revenue = len(rows), sum(t[1] for t in totals.values())
+    figures = f"""<div class="figures">
+<div><b>{n:,}</b><span>Orders, {esc(label.lower())}</span></div>
+<div><b>{money(revenue, cur_sign)}</b><span>Revenue</span></div>
+<div><b>{totals['meta_ad'][0]:,}</b><span>From a known Meta ad, {pct(totals['meta_ad'][0], n)}%</span></div>
+<div><b>{totals['meta_no_ad'][0]:,}</b><span>Meta, ad not tagged</span></div>
+<div><b>{totals['other'][0]:,}</b><span>Other sources</span></div>
+<div><b>{totals['none'][0]:,}</b><span>No ad click found</span></div></div>"""
+    note = ""
+    if totals["meta_no_ad"][0] or "Not tagged" in accounts:
+        note = ('<p class="note">Some sales came from Meta ads whose links do not carry the full tags, so the ad or '
+                'account is unknown. In every ad of both accounts set URL parameters to:<br><code>utm_source=facebook'
+                '&amp;utm_medium=paid&amp;utm_campaign={{campaign.id}}&amp;utm_content={{ad.id}}&amp;utm_term={{adset.id}}'
+                '&amp;utm_id=main</code><br>with <code>utm_id=bm2</code> (or any name) in the second account.</p>')
+    acc_rows = "".join(
+        f"<tr><td>{esc(a)}</td><td class='num'>{o:,}</td><td class='num'>{pct(o, n)}%</td>"
+        f"<td class='num'>{money(r, cur_sign)}</td></tr>"
+        for a, (o, r) in sorted(accounts.items(), key=lambda kv: (-kv[1][0], -kv[1][1])))
+    ad_rows = "".join(
+        f"<tr><td>{esc(a)}</td><td>{esc(camp)}</td><td>{esc(adset)}</td><td>{esc(ad)}</td>"
+        f"<td class='num'>{o:,}</td><td class='num'>{money(r, cur_sign)}</td></tr>"
+        for (a, camp, adset, ad), (o, r) in sorted(ads.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))[:100])
+    order_rows = "".join(
+        f"<tr><td>{esc(ts.astimezone(SALES_TZ).strftime('%a %d %b %H:%M'))}</td><td>{esc(oid)}</td>"
+        f"<td class='num'>{money(v, cur_sign)}</td><td style='white-space:normal'>{esc(w)}</td></tr>"
+        for ts, oid, v, w in orders[:200])
+    by_account = (f"""<h2>By ad account</h2><div class="scroll"><table><thead><tr><th>Account (utm_id)</th>
+<th class="num">Orders</th><th class="num">Share</th><th class="num">Revenue</th></tr></thead><tbody>{acc_rows}</tbody></table></div>"""
+                  if accounts else "")
+    by_ad = (f"""<h2>By ad</h2><div class="scroll"><table><thead><tr><th>Account</th><th>Campaign</th><th>Ad set</th><th>Ad</th>
+<th class="num">Orders</th><th class="num">Revenue</th></tr></thead><tbody>{ad_rows}</tbody></table></div>""" if ads else "")
+    return f"""{intro}{figures}{note}{by_account}{by_ad}
+<h2>Every order</h2><div class="scroll"><table><thead><tr><th>When</th><th>Order ID</th><th class="num">Value</th>
+<th>Credited to</th></tr></thead><tbody>{order_rows}</tbody></table></div>"""

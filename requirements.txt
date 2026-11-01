@@ -6,3 +6,4 @@ gunicorn
 google-auth>=2.40,<3
 cryptography>=44,<51
 phonenumbers>=8.13,<10
+tzdata
