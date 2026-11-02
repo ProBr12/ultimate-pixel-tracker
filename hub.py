@@ -26,6 +26,8 @@ import alerts
 import stores
 
 SNIPPET_VERSION = 9
+# Extra pixels per store (form slots). Slot 1 keeps the original field names.
+EXTRA_SLOT_SUFFIXES = ("", "_2", "_3")
 CHECKOUT_PIXEL_VERSION = 4
 bp = Blueprint("hub", __name__, url_prefix="/hub")
 _send_capi_event = None
@@ -530,8 +532,8 @@ def read_store_form(existing=None):
         "tracking_host": re.sub(r"^https?://", "", f.get("tracking_host", "").strip().lower()).strip("/") or None,
         "enabled": f.get("enabled") == "on" if existing else True,
     }
-    extra_id = f.get("extra_pixel_id", "").strip()
-    extra_token = f.get("extra_access_token", "").strip()
+    extra_slots = [(f.get(f"extra_pixel_id{suffix}", "").strip(), f.get(f"extra_access_token{suffix}", "").strip())
+                   for suffix in EXTRA_SLOT_SUFFIXES]
     if not 2 <= len(values["name"]) <= 60:
         return None, "Give the store a name (2 to 60 characters)."
     if not values["shop_domain"]:
@@ -559,23 +561,26 @@ def read_store_form(existing=None):
         return None, "The tracking address must look like track.yourstore.com."
     if values["test_event_code"] and not stores.TEST_CODE_RE.fullmatch(values["test_event_code"]):
         return None, "The test event code looks like TEST12345 (from Events Manager, Test events)."
-    # Extra pixel: every event also goes here (e.g. a pixel in a second Business
-    # Manager). Blank ID removes it; blank token keeps the saved one for that ID.
-    if not extra_id:
-        values["extra_pixels"] = []
-    else:
+    # Extra pixels: every event also goes to each (e.g. a pixel in another Business
+    # Manager). A blank ID removes that slot; a blank token keeps the one saved for that ID.
+    saved = {x["pixel_id"]: x["access_token"] for x in (existing or {}).get("extra_pixels") or []}
+    values["extra_pixels"] = []
+    for n, (extra_id, extra_token) in enumerate(extra_slots, 1):
+        if not extra_id:
+            continue
+        label = "extra pixel" if n == 1 else f"extra pixel {n}"
         if not stores.PIXEL_ID_RE.fullmatch(extra_id):
-            return None, "The extra pixel ID is the long number shown in Events Manager (digits only)."
+            return None, f"The {label} ID is the long number shown in Events Manager (digits only)."
         if extra_id == values["pixel_id"]:
-            return None, "The extra pixel must be a different pixel from the main one."
+            return None, f"The {label} must be a different pixel from the main one."
+        if any(x["pixel_id"] == extra_id for x in values["extra_pixels"]):
+            return None, f"Pixel {extra_id} is entered twice. Each extra pixel must be different."
         if extra_token and not re.fullmatch(r"[A-Za-z0-9]{40,600}", extra_token):
-            return None, "That extra pixel access token does not look right. Copy it again from Events Manager."
+            return None, f"That {label} access token does not look right. Copy it again from Events Manager."
+        extra_token = extra_token or saved.get(extra_id)
         if not extra_token:
-            saved = {x["pixel_id"]: x["access_token"] for x in (existing or {}).get("extra_pixels") or []}
-            extra_token = saved.get(extra_id)
-        if not extra_token:
-            return None, "Add the Conversions API access token for the extra pixel (made in its own Business Manager)."
-        values["extra_pixels"] = [{"pixel_id": extra_id, "access_token": extra_token}]
+            return None, f"Add the Conversions API access token for the {label} (made in its own Business Manager)."
+        values["extra_pixels"].append({"pixel_id": extra_id, "access_token": extra_token})
     return values, None
 
 
@@ -587,6 +592,19 @@ def store_form(store, error=""):
     currency = esc(s.get("currency") or "GBP")
     enabled = "" if new else f"""<label class="check"><input type="checkbox" name="enabled" {'checked' if s.get('enabled') else ''}>
 Send this store's events to Meta</label>"""
+    extras = s.get("extra_pixels") or []
+    extra_fields = ""
+    for n, suffix in enumerate(EXTRA_SLOT_SUFFIXES, 1):
+        current = extras[n - 1]["pixel_id"] if n <= len(extras) else ""
+        help_text = ("A pixel that gets every event too, browser and server, with the same event IDs. For a pixel "
+                     "in another Business Manager. Leave empty for none; clearing it stops sending there. After "
+                     "changing it, copy the tracking code and checkout pixel again from Setup.") if n == 1 else "Optional, same as above."
+        extra_fields += f"""<div class="row">
+<label>Extra pixel {n} ID<span>{help_text}</span>
+<input type="text" name="extra_pixel_id{suffix}" value="{esc(current)}" inputmode="numeric"></label>
+<label>Extra pixel {n} access token<span>Generated on that pixel's own Settings page. {keep if current else ''}</span>
+<input type="password" name="extra_access_token{suffix}"></label>
+</div>"""
     return f"""{f'<p class="note bad">{esc(error)}</p>' if error else ''}
 <form class="fields" method="post" autocomplete="off">{csrf_field()}
 <label>Store name<input type="text" name="name" value="{esc(s.get('name'))}" required maxlength="60"></label>
@@ -610,12 +628,7 @@ Send this store's events to Meta</label>"""
 <label>Tracking address (optional)<span>A subdomain of the store's own site, like track.yourstore.com, where shoppers'
 browsers send events. The Setup tab shows how to point it at the hub. Leave empty to use the hub's address.</span>
 <input type="text" name="tracking_host" value="{esc(s.get('tracking_host'))}" placeholder="track.yourstore.com"></label>
-<label>Extra pixel ID (optional)<span>A second pixel that gets every event too, browser and server, with the
-same event IDs. For a pixel in another Business Manager. Leave empty for none; clearing it stops sending there.
-After changing it, copy the tracking code and checkout pixel again from Setup.</span>
-<input type="text" name="extra_pixel_id" value="{esc(((s.get('extra_pixels') or [{}])[0]).get('pixel_id'))}" inputmode="numeric"></label>
-<label>Extra pixel access token<span>Generated on the extra pixel's own Settings page. {keep}</span>
-<input type="password" name="extra_access_token"></label>
+{extra_fields}
 <label>Test event code (optional)<span>Events Manager, Test events. Only the hub's test button uses it.</span>
 <input type="text" name="test_event_code" value="{esc(s.get('test_event_code'))}" placeholder="TEST12345"></label>
 {enabled}

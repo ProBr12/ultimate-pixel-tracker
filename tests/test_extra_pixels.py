@@ -150,3 +150,46 @@ def test_blank_token_keeps_the_saved_one_and_blank_id_removes_it(logged_in):
         # Put it back for any test that runs after.
         assert logged_in.post(f"/hub/stores/{store_id}", data=form(
             extra_pixel_id=EXTRA_PIXEL, extra_access_token=EXTRA_TOKEN)).status_code == 302
+
+
+# ============ A SECOND EXTRA PIXEL ============
+
+THIRD_PIXEL, THIRD_TOKEN = "999111222333", "THIRD" + "t" * 60
+
+
+def test_two_extra_pixels_get_every_event_and_appear_in_the_code(logged_in, app_client, wire):
+    store_id = row()["id"]
+    w = Wire()
+    with patch("requests.get", side_effect=w.get):
+        r = logged_in.post(f"/hub/stores/{store_id}", data=form(
+            extra_pixel_id=EXTRA_PIXEL, extra_pixel_id_2=THIRD_PIXEL, extra_access_token_2=THIRD_TOKEN))
+    assert r.status_code == 302, r.data
+    assert row()["extra_pixels"] == [{"pixel_id": EXTRA_PIXEL, "access_token": EXTRA_TOKEN},
+                                     {"pixel_id": THIRD_PIXEL, "access_token": THIRD_TOKEN}]
+
+    assert track(app_client, SHOP, event_id="ev_three").status_code == 200
+    sent = by_pixel(wait_for(wire, 3))
+    assert set(sent) == {MAIN_PIXEL, EXTRA_PIXEL, THIRD_PIXEL}
+    assert sent[THIRD_PIXEL]["body"]["access_token"] == THIRD_TOKEN
+    assert sent[THIRD_PIXEL]["body"]["data"] == sent[MAIN_PIXEL]["body"]["data"]
+
+    snippet = logged_in.get(f"/hub/stores/{store_id}/snippet.liquid").get_data(as_text=True)
+    assert snippet.count("fbq('init'") == 3 and f"tr?id={THIRD_PIXEL}&ev=PageView" in snippet
+    pixel = logged_in.get(f"/hub/stores/{store_id}/checkout-pixel.js").get_data(as_text=True)
+    assert f'const EXTRA_PIXEL_IDS = ["{EXTRA_PIXEL}", "{THIRD_PIXEL}"];' in pixel
+
+    settings = logged_in.get(f"/hub/stores/{store_id}?tab=settings").get_data(as_text=True)
+    assert f'value="{THIRD_PIXEL}"' in settings and THIRD_TOKEN not in settings
+
+    # Saving again with blank tokens keeps both saved tokens.
+    with patch("requests.get", side_effect=w.get):
+        assert logged_in.post(f"/hub/stores/{store_id}", data=form(
+            extra_pixel_id=EXTRA_PIXEL, extra_pixel_id_2=THIRD_PIXEL)).status_code == 302
+    assert [x["access_token"] for x in row()["extra_pixels"]] == [EXTRA_TOKEN, THIRD_TOKEN]
+
+    # The same pixel twice is refused; clearing slot 2 removes only it.
+    with patch("requests.get", side_effect=w.get):
+        r = logged_in.post(f"/hub/stores/{store_id}", data=form(extra_pixel_id=EXTRA_PIXEL, extra_pixel_id_2=EXTRA_PIXEL))
+        assert r.status_code == 200 and b"entered twice" in r.data
+        assert logged_in.post(f"/hub/stores/{store_id}", data=form(extra_pixel_id=EXTRA_PIXEL)).status_code == 302
+    assert row()["extra_pixels"] == [{"pixel_id": EXTRA_PIXEL, "access_token": EXTRA_TOKEN}]
