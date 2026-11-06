@@ -1074,6 +1074,10 @@ def handle_checkout(shop, config, checkout):
     if not isinstance(currency, str) or not re.fullmatch(r"[A-Z]{3}", currency):
         currency = checkout.get("currency") if isinstance(checkout.get("currency"), str) else config["currency"]
 
+    # The US pixel gets only US checkouts (USD or shipping to the US), as with
+    # Purchase; every other pixel gets every checkout.
+    pixels, send_primary = us_pixel_route(config, is_us_order(checkout))
+
     try:
         response = send_capi_event(
             event_name=CHECKOUT_EVENT,
@@ -1089,11 +1093,13 @@ def handle_checkout(shop, config, checkout):
             external_id=[vid, buyer["customer_id"]],
             content_ids=content_ids, content_type="product",
             contents=contents, num_items=num_items,
-            pixel_id=config["pixel_id"], access_token=config["access_token"],
-            extra_pixels=config.get("extra_pixels"),
+            pixel_id=pixels["pixel_id"], access_token=pixels["access_token"],
+            extra_pixels=pixels["extra_pixels"], send_primary=send_primary,
             default_country=config["default_country"],
             log={"shop": shop, "source": "webhook"})
-        delivered = 200 <= response.status_code < 300
+        # Main pixel skipped (US pixel, non-US checkout): the extras have it,
+        # so the checkout counts as sent and is not retried on the next update.
+        delivered = not send_primary or 200 <= response.status_code < 300
     except Exception as e:
         logger.error(f"{CHECKOUT_EVENT} send failed: {type(e).__name__}")
         delivered = False

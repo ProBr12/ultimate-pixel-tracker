@@ -1,6 +1,7 @@
 """The US pixel gets only US events. UK orders (and every other non-US order)
 never reach it, whether it is a store's extra pixel or its main one, and the
 UK pixels keep getting every order exactly as before."""
+import json
 import time
 
 import pytest
@@ -9,7 +10,7 @@ from unittest.mock import patch
 import main
 import stores
 from conftest import hub_client
-from test_hub import UA, Wire, post_order, track, wire  # noqa: F401  (wire is a fixture)
+from test_hub import UA, Wire, post_order, signed, track, wire  # noqa: F401  (wire is a fixture)
 
 US_PIXEL = main.US_PIXEL_ID
 UK_PIXEL, UK_PIXEL_2 = "1449380569544787", "2183170248967407"
@@ -151,6 +152,73 @@ def test_us_browser_event_reaches_the_us_pixel(app_client, wire, extra):
 def test_uk_browser_event_skips_a_us_main_pixel(app_client, wire):
     assert track(app_client, US_MAIN_SHOP, event_id="ev_uk2").status_code == 200
     assert pixels(sent_after(wire, 2)) == sorted([UK_PIXEL, UK_PIXEL_2])
+
+
+# ============ CHECKOUT WEBHOOK (AddPaymentInfo) ============
+
+def post_checkout(client, shop, key, body):
+    raw, sig = signed(body, key)
+    return client.post("/webhook/checkout", data=raw, headers={
+        "X-Shopify-Shop-Domain": shop, "X-Shopify-Hmac-Sha256": sig, "X-Shopify-Topic": "checkouts/update"})
+
+
+def uk_checkout(token, **changes):
+    """A checkout at the payment step, with the user agent from the checkout pixel."""
+    address = {"address1": "1 High St", "zip": "AL1 3XY", "country": "United Kingdom", "country_code": "GB"}
+    return {"token": token, "email": "shopper@example.com", "total_price": "49.99",
+            "presentment_currency": "GBP", "currency": "GBP",
+            "abandoned_checkout_url": "https://comfishop.com/checkouts/x?key=secret",
+            "billing_address": dict(address), "shipping_address": dict(address),
+            "line_items": [{"product_id": 9002, "quantity": 1, "price": "49.99"}], **changes}
+
+
+def checkout_sent(app_client, wire, shop, key, body, count):
+    r = app_client.post("/meta/context", data=json.dumps({"checkout_token": body["token"], "user_agent": UA}),
+                        content_type="text/plain")
+    assert r.status_code == 200, r.data
+    r = post_checkout(app_client, shop, key, body)
+    assert r.status_code == 200, r.data
+    sent = sent_after(wire, count)
+    assert {p["body"]["data"][0]["event_name"] for p in sent} == {"AddPaymentInfo"}
+    assert {p["body"]["data"][0]["event_id"] for p in sent} == {f"addpaymentinfo_{body['token']}"}
+    return r.get_json()["result"], sent
+
+
+def test_uk_checkout_never_reaches_the_us_pixel(app_client, wire):
+    result, sent = checkout_sent(app_client, wire, US_EXTRA_SHOP, US_EXTRA_KEY, uk_checkout("chkukx00001"), 2)
+    assert result == "sent"
+    assert pixels(sent) == sorted([UK_PIXEL, UK_PIXEL_2])
+    assert token_for(sent, UK_PIXEL) == UK_TOKEN and token_for(sent, UK_PIXEL_2) == UK_TOKEN_2
+
+
+@pytest.mark.parametrize("token,changes", [
+    ("chkusx00001", {"presentment_currency": "USD"}),
+    ("chkusx00002", {"shipping_address": {"address1": "1 Main St", "zip": "94105", "country_code": "US"}}),
+])
+def test_us_checkout_reaches_the_us_pixel_and_the_uk_ones(app_client, wire, token, changes):
+    result, sent = checkout_sent(app_client, wire, US_EXTRA_SHOP, US_EXTRA_KEY, uk_checkout(token, **changes), 3)
+    assert result == "sent"
+    assert pixels(sent) == sorted([UK_PIXEL, UK_PIXEL_2, US_PIXEL])
+    assert token_for(sent, US_PIXEL) == US_TOKEN
+
+
+def test_uk_checkout_skips_a_us_main_pixel_and_is_not_resent(app_client, wire):
+    body = uk_checkout("chkukm00001")
+    result, sent = checkout_sent(app_client, wire, US_MAIN_SHOP, US_MAIN_KEY, body, 2)
+    # Counted as sent (the UK extras have it), so the next update does not resend it.
+    assert result == "sent"
+    assert pixels(sent) == sorted([UK_PIXEL, UK_PIXEL_2])
+    wire.posts.clear()
+    r = post_checkout(app_client, US_MAIN_SHOP, US_MAIN_KEY, body)
+    assert r.get_json()["result"] == "already_sent"
+    assert sent_after(wire, 1, seconds=0.3) == []
+
+
+def test_us_checkout_reaches_a_us_main_pixel(app_client, wire):
+    result, sent = checkout_sent(app_client, wire, US_MAIN_SHOP, US_MAIN_KEY,
+                                 uk_checkout("chkusm00001", presentment_currency="USD"), 3)
+    assert result == "sent"
+    assert pixels(sent) == sorted([UK_PIXEL, UK_PIXEL_2, US_PIXEL])
 
 
 # ============ THE RULES ============
