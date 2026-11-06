@@ -270,7 +270,7 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
                     contents=None, num_items=None, order_id=None,
                     pixel_id=None, access_token=None, matched=None,
                     test_event_code=None, log=None, default_country="GB",
-                    extra_pixels=None):
+                    extra_pixels=None, send_primary=True):
 
     PIXEL_ID = pixel_id if pixel_id is not None else os.environ.get("PIXEL_ID")
     ACCESS_TOKEN = access_token if access_token is not None else os.environ.get("ACCESS_TOKEN")
@@ -351,6 +351,11 @@ def send_capi_event(event_name, event_id, fbc=None, fbp=None, fbclid=None,
         if extra.get("pixel_id") and extra["pixel_id"] != PIXEL_ID:
             EXTRA_PIXEL_POOL.submit(send_to_extra_pixel, extra, {"data": payload["data"], "access_token": extra["access_token"]},
                                     event_name, list(user_data.keys()), log)
+
+    if not send_primary:
+        # The main pixel is the US pixel and this is not a US event (us_pixel_route).
+        logger.info(f"Not sent to main pixel {PIXEL_ID} (US pixel, non-US event): {event_name} | event_id: {event_id}")
+        return None
 
     try:
         response = requests.post(
@@ -451,6 +456,53 @@ def site_origin(url):
     if parsed.scheme == "https" and parsed.hostname:
         return f"https://{parsed.hostname}"
     return None
+
+
+# ============ US PIXEL ROUTING ============
+# Comfi's US Meta pixel only gets US traffic, like the theme, which inits it
+# only on the US market (US localization or /en-us). It can be set up as a
+# store's extra pixel or as its main one; either way a non-US event never
+# reaches it, and every other pixel gets exactly what it got before.
+
+US_PIXEL_ID = "27621646037533557"
+US_COUNTRY_NAMES = ("US", "USA", "UNITED STATES", "UNITED STATES OF AMERICA")
+
+
+def is_us_order(order):
+    """A US order: paid in US dollars, or shipped to the US."""
+    money = ((order.get("total_price_set") or {}).get("presentment_money") or {})
+    if not isinstance(money, dict):
+        money = {}
+    currencies = (order.get("presentment_currency"), money.get("currency_code"))
+    if any(isinstance(c, str) and c.strip().upper() == "USD" for c in currencies):
+        return True
+    shipping = order.get("shipping_address")
+    if not isinstance(shipping, dict):
+        return False
+    if isinstance(shipping.get("country_code"), str) and shipping["country_code"].strip().upper() == "US":
+        return True
+    country = shipping.get("country")
+    return isinstance(country, str) and country.strip().upper() in US_COUNTRY_NAMES
+
+
+def is_us_browser_event(source_url, currency):
+    """A US storefront event: a page on the US market (/en-us) or priced in USD."""
+    return ((isinstance(source_url, str) and "/en-us" in source_url.lower())
+            or (isinstance(currency, str) and currency.upper() == "USD"))
+
+
+def us_pixel_route(config, us):
+    """The pixel_id, access_token and extra_pixels to send one event with, and
+    whether the main pixel gets it. A non-US event drops the US pixel from the
+    extras, and skips the main pixel when the US pixel is the main one (the
+    extras still get it, as before)."""
+    route = {"pixel_id": config.get("pixel_id"), "access_token": config.get("access_token"),
+             "extra_pixels": config.get("extra_pixels")}
+    if us:
+        return route, True
+    route["extra_pixels"] = [x for x in route["extra_pixels"] or ()
+                             if str(x.get("pixel_id")) != US_PIXEL_ID]
+    return route, str(route["pixel_id"]) != US_PIXEL_ID
 
 
 def note_attributes(record):
@@ -857,6 +909,9 @@ def order_created():
         order_id=order_id,
         shop=shop)
 
+    # The US pixel gets only US orders; every other pixel gets every order.
+    pixels, send_primary = us_pixel_route(config, is_us_order(order))
+
     send_capi_event(
         event_name="Purchase",
         event_id=f"purchase_{order_id}",
@@ -885,9 +940,10 @@ def order_created():
         contents=contents,
         num_items=num_items,
         order_id=order_id,
-        pixel_id=config["pixel_id"],
-        access_token=config["access_token"],
-        extra_pixels=config.get("extra_pixels"),
+        pixel_id=pixels["pixel_id"],
+        access_token=pixels["access_token"],
+        extra_pixels=pixels["extra_pixels"],
+        send_primary=send_primary,
         default_country=config["default_country"],
         log={"shop": shop, "source": "webhook"}
     )
@@ -1382,6 +1438,12 @@ def track_event():
         value=value,
         shop=shop)
 
+    # Store events: the US pixel gets only US ones (as the theme's gate). The
+    # WooCommerce relay brings its own pixel and is sent as it was.
+    pixels, send_primary = {}, True
+    if not woo_options:
+        pixels, send_primary = us_pixel_route(config, is_us_browser_event(body.get("source_url"), currency))
+
     response = send_capi_event(
         event_name=event_name,
         event_id=body.get("event_id", f"evt_{int(time.time())}"),
@@ -1398,7 +1460,8 @@ def track_event():
         external_id=vid,
         matched=known.get("match"),
         default_country=config.get("default_country") or "GB",
-        **{k: v for k, v in config.items() if k in ("pixel_id", "access_token", "extra_pixels")},
+        **pixels,
+        send_primary=send_primary,
         **extras,
         log={"shop": shop, "source": "woo-relay" if woo_options else "browser",
              "version": version, "restored": restored}
